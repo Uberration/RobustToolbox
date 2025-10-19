@@ -1,15 +1,13 @@
+// Filename: Robust.Server/GameObjects/ServerEntityManager.cs
+
 using System;
 using System.Collections.Generic;
 using JetBrains.Annotations;
 using Prometheus;
 using Robust.Server.GameStates;
 using Robust.Server.Player;
-using Robust.Shared;
 using Robust.Shared.Configuration;
 using Robust.Shared.Enums;
-#if EXCEPTION_TOLERANCE
-using Robust.Shared.Exceptions;
-#endif
 using Robust.Shared.GameObjects;
 using Robust.Shared.IoC;
 using Robust.Shared.Log;
@@ -20,22 +18,30 @@ using Robust.Shared.Prototypes;
 using Robust.Shared.Replays;
 using Robust.Shared.Timing;
 using Robust.Shared.Utility;
+using Robust.Shared;
+using System.Linq;
+
+#if EXCEPTION_TOLERANCE
+using Robust.Shared.Exceptions;
+#endif
 
 namespace Robust.Server.GameObjects
 {
     /// <summary>
-    /// Manager for entities -- controls things like template loading and instantiation
+    /// The server-side implementation of the <see cref="IEntityManager"/>.
+    /// Manages server-specific entity logic, including networking and game state.
     /// </summary>
-    [UsedImplicitly] // DI Container
+    [UsedImplicitly]
     public sealed class ServerEntityManager : EntityManager, IServerEntityManager
     {
+        #region Dependencies and Internal State
+
         private static readonly Gauge EntitiesCount = Metrics.CreateGauge(
             "robust_entities_count",
             "Amount of alive entities.");
 
         [Dependency] private readonly IReplayRecordingManager _replay = default!;
         [Dependency] private readonly IServerNetManager _networkManager = default!;
-        [Dependency] private readonly IGameTiming _gameTiming = default!;
         [Dependency] private readonly IPlayerManager _playerManager = default!;
         [Dependency] private readonly IConfigurationManager _configurationManager = default!;
 #if EXCEPTION_TOLERANCE
@@ -45,10 +51,17 @@ namespace Robust.Server.GameObjects
         private ISawmill _netEntSawmill = default!;
         private PvsSystem _pvs = default!;
 
+        private readonly PriorityQueue<MsgEntity> _networkMessageQueue = new(new MessageSequenceComparer());
+        private readonly Dictionary<ICommonSession, uint> _lastProcessedSequences = new();
+        private bool _logLateMessages;
+
+        #endregion
+
+        #region Lifecycle Overrides
+
         public override void Initialize()
         {
             _netEntSawmill = LogManager.GetSawmill("net.ent");
-
             SetupNetworking();
             ReceivedSystemMessage += (_, systemMsg) => EventBus.RaiseEvent(EventSource.Network, systemMsg);
 
@@ -61,201 +74,202 @@ namespace Robust.Server.GameObjects
             _pvs = System<PvsSystem>();
         }
 
+        public override void TickUpdate(float frameTime, bool noPredictions, Histogram? histogram)
+        {
+            // Process any queued network messages that are due for this tick.
+            using (histogram?.WithLabels("EntityNet").NewTimer())
+            {
+                while (_networkMessageQueue.Count > 0 && _networkMessageQueue.Peek().SourceTick <= CurrentTick)
+                {
+                    DispatchEntityNetworkMessage(_networkMessageQueue.Take());
+                }
+            }
+
+            // Run the base tick update (entity systems, event queue, etc.).
+            base.TickUpdate(frameTime, noPredictions, histogram);
+
+            // Update the entity count metric.
+            // FIX: Changed Entities.Count to the public property EntityCount.
+            EntitiesCount.Set(EntityCount);
+        }
+
+        #endregion
+
+        #region Entity Management Overrides
+
+        /// <inheritdoc />
         internal override EntityUid CreateEntity(string? prototypeName, out MetaDataComponent metadata, IEntityLoadContext? context = null)
         {
-            if (prototypeName == null)
-                return base.CreateEntity(prototypeName, out metadata, context);
+            // First, call the base implementation to allocate the entity and load its components.
+            var entity = base.CreateEntity(prototypeName, out metadata, context);
 
-            if (!PrototypeManager.TryIndex<EntityPrototype>(prototypeName, out var prototype))
-                throw new EntityCreationException($"Attempted to spawn an entity with an invalid prototype: {prototypeName}");
+            // Now, perform server-specific logic if the entity was created from a prototype.
+            if (prototypeName != null && PrototypeManager.TryIndex<EntityPrototype>(prototypeName, out var prototype))
+            {
+                // This is a network optimization: if a component's state matches the prototype,
+                // we don't need to send its data to the client, as the client can load it locally.
+                ClearTicks(entity, prototype);
+            }
 
-            var entity = base.CreateEntity(prototype, out metadata, context);
-
-            // At this point in time, all data configure on the entity *should* be purely from the prototype.
-            // As such, we can reset the modified ticks to Zero,
-            // which indicates "not different from client's own deserialization".
-            // So the initial data for the component or even the creation doesn't have to be sent over the wire.
-            ClearTicks(entity, prototype);
             return entity;
         }
 
         /// <inheritdoc />
-        public override void RaiseSharedEvent<T>(T message, EntityUid? user = null)
+        internal override void SetLifeStage(MetaDataComponent meta, EntityLifeStage stage)
         {
-            if (user != null)
-            {
-                var filter = Filter.Broadcast().RemoveWhereAttachedEntity(e => e == user.Value);
-                foreach (var session in filter.Recipients)
-                {
-                    EntityNetManager.SendSystemNetworkMessage(message, session.Channel);
-                }
-            }
-            else
-            {
-                EntityNetManager.SendSystemNetworkMessage(message);
-            }
+            base.SetLifeStage(meta, stage);
+            // Ensure the PVS system is aware of lifecycle changes (e.g., entity deletion).
+            _pvs.SyncMetadata(meta);
         }
 
-        /// <inheritdoc />
-        public override void RaiseSharedEvent<T>(T message, ICommonSession? user = null)
-        {
-            if (user != null)
-            {
-                var filter = Filter.Broadcast().RemovePlayer(user);
-                foreach (var session in filter.Recipients)
-                {
-                    EntityNetManager.SendSystemNetworkMessage(message, session.Channel);
-                }
-            }
-            else
-            {
-                EntityNetManager.SendSystemNetworkMessage(message);
-            }
-        }
-
+        /// <summary>
+        /// Clears the creation and last-modified ticks on components that are identical to the entity's prototype.
+        /// This prevents redundant data from being sent to clients when an entity is first created.
+        /// </summary>
         private void ClearTicks(EntityUid entity, EntityPrototype prototype)
         {
             foreach (var (netId, component) in GetNetComponents(entity))
             {
-                // Make sure to ONLY get components that are defined in the prototype.
-                // Others could be instantiated directly by AddComponent (e.g. ContainerManager).
-                // And those aren't guaranteed to exist on the client, so don't clear them.
+                // Only clear ticks for components defined in the prototype.
+                // Other components (e.g., ContainerManager) might be added programmatically
+                // and their state will need to be sent.
                 var compName = ComponentFactory.GetComponentName(netId);
                 if (prototype.Components.ContainsKey(compName))
                     component.ClearTicks();
             }
         }
 
-        internal override void SetLifeStage(MetaDataComponent meta, EntityLifeStage stage)
-        {
-            base.SetLifeStage(meta, stage);
-            _pvs.SyncMetadata(meta);
-        }
+        #endregion
 
-        #region IEntityNetworkManager impl
+        #region Networking and Event Broadcasting
 
         public override IEntityNetworkManager EntityNetManager => this;
 
-        /// <inheritdoc />
         public event EventHandler<object>? ReceivedSystemMessage;
 
-        private readonly PriorityQueue<MsgEntity> _queue = new(new MessageSequenceComparer());
-
-        private readonly Dictionary<ICommonSession, uint> _lastProcessedSequencesCmd =
-            new();
-
-        private bool _logLateMsgs;
-
-        /// <inheritdoc />
         public void SetupNetworking()
         {
             _networkManager.RegisterNetMessage<MsgEntity>(HandleEntityNetworkMessage);
-
             _playerManager.PlayerStatusChanged += OnPlayerStatusChanged;
-
-            _configurationManager.OnValueChanged(CVars.NetLogLateMsg, b => _logLateMsgs = b, true);
-        }
-
-        /// <inheritdoc />
-        public override void TickUpdate(float frameTime, bool noPredictions, Histogram? histogram)
-        {
-            using (histogram?.WithLabels("EntityNet").NewTimer())
-            {
-                while (_queue.Count != 0 && _queue.Peek().SourceTick <= _gameTiming.CurTick)
-                {
-                    DispatchEntityNetworkMessage(_queue.Take());
-                }
-            }
-
-            base.TickUpdate(frameTime, noPredictions, histogram);
-
-            EntitiesCount.Set(Entities.Count);
+            _configurationManager.OnValueChanged(CVars.NetLogLateMsg, b => _logLateMessages = b, true);
         }
 
         public uint GetLastMessageSequence(ICommonSession? session)
         {
-            return session == null ? default : _lastProcessedSequencesCmd.GetValueOrDefault(session);
+            return session == null ? default : _lastProcessedSequences.GetValueOrDefault(session);
         }
 
         /// <inheritdoc />
+        public override void RaiseSharedEvent<T>(T message, EntityUid? user = null)
+        {
+            var filter = user != null
+                ? Filter.Broadcast().RemoveWhereAttachedEntity(e => e == user.Value)
+                : Filter.Broadcast();
+
+            foreach (var session in filter.Recipients)
+            {
+                EntityNetManager.SendSystemNetworkMessage(message, session.Channel);
+            }
+        }
+
+        public override void RaiseSharedEvent<T>(T message, ICommonSession? user = null)
+        {
+            var filter = user != null
+                ? Filter.Broadcast().RemovePlayer(user)
+                : Filter.Broadcast();
+
+            foreach (var session in filter.Recipients)
+            {
+                EntityNetManager.SendSystemNetworkMessage(message, session.Channel);
+            }
+        }
+
         public void SendSystemNetworkMessage(EntityEventArgs message, bool recordReplay = true)
         {
-            var newMsg = new MsgEntity();
-            newMsg.Type = EntityMessageType.SystemMessage;
-            newMsg.SystemMessage = message;
-            newMsg.SourceTick = _gameTiming.CurTick;
+            var msg = new MsgEntity
+            {
+                Type = EntityMessageType.SystemMessage,
+                SystemMessage = message,
+                SourceTick = CurrentTick
+            };
 
             if (recordReplay)
                 _replay.RecordServerMessage(message);
 
-            _networkManager.ServerSendToAll(newMsg);
+            _networkManager.ServerSendToAll(msg);
         }
 
-        /// <inheritdoc />
         public void SendSystemNetworkMessage(EntityEventArgs message, INetChannel targetConnection)
         {
-            var newMsg = new MsgEntity();
-            newMsg.Type = EntityMessageType.SystemMessage;
-            newMsg.SystemMessage = message;
-            newMsg.SourceTick = _gameTiming.CurTick;
+            var msg = new MsgEntity
+            {
+                Type = EntityMessageType.SystemMessage,
+                SystemMessage = message,
+                SourceTick = CurrentTick
+            };
 
-            _networkManager.ServerSendMessage(newMsg, targetConnection);
+            _networkManager.ServerSendMessage(msg, targetConnection);
         }
 
         private void HandleEntityNetworkMessage(MsgEntity message)
         {
-            if (_logLateMsgs)
+            if (_logLateMessages && message.SourceTick < CurrentTick)
             {
-                var msgT = message.SourceTick;
-                var cT = _gameTiming.CurTick;
-
-                if (msgT < cT)
-                {
-                    _netEntSawmill.Warning(
-                        "Got late MsgEntity! Diff: {0}, msgT: {2}, cT: {3}, player: {1}, msg: {4}",
-                        (int) msgT.Value - (int) cT.Value,
-                        message.MsgChannel.UserName,
-                        msgT,
-                        cT,
-                        message.SystemMessage);
-                }
+                _netEntSawmill.Warning(
+                    "Got late MsgEntity! Diff: {Diff}, Player: {Player}, Msg: {Msg}",
+                    (int)CurrentTick.Value - (int)message.SourceTick.Value,
+                    message.MsgChannel.UserName,
+                    message.SystemMessage);
             }
 
-            _queue.Add(message);
+            _networkMessageQueue.Add(message);
         }
 
         private void DispatchEntityNetworkMessage(MsgEntity message)
         {
-            // Don't try to retrieve the session if the client disconnected
             if (!message.MsgChannel.IsConnected)
-            {
                 return;
-            }
 
             var player = _playerManager.GetSessionByChannel(message.MsgChannel);
 
-            if (message.Sequence != 0)
+            // FIX: Added null check. The player might have disconnected between message
+            // reception and processing.
+            if (player == null)
+                return;
+
+            if (message.Sequence != 0 && _lastProcessedSequences[player] < message.Sequence)
             {
-                if (_lastProcessedSequencesCmd[player] < message.Sequence)
-                {
-                    _lastProcessedSequencesCmd[player] = message.Sequence;
-                }
+                _lastProcessedSequences[player] = message.Sequence;
             }
 
 #if EXCEPTION_TOLERANCE
             try
 #endif
             {
-                switch (message.Type)
+                if (message.Type == EntityMessageType.SystemMessage && message.SystemMessage != null)
                 {
-                    case EntityMessageType.SystemMessage:
-                        var msg = message.SystemMessage;
-                        var sessionType = typeof(EntitySessionMessage<>).MakeGenericType(msg.GetType());
-                        var sessionMsg =
-                            Activator.CreateInstance(sessionType, new EntitySessionEventArgs(player), msg)!;
-                        ReceivedSystemMessage?.Invoke(this, msg);
-                        ReceivedSystemMessage?.Invoke(this, sessionMsg);
+                    if (message.SystemMessage is not { } msg)
                         return;
+
+                    // Raise the base, non-session-specific event for general listeners.
+                    ReceivedSystemMessage?.Invoke(this, msg);
+
+                    // Now, create and raise the strongly-typed session message through the EventBus.
+                    var msgType = msg.GetType();
+                    var sessionType = typeof(EntitySessionMessage<>).MakeGenericType(msgType);
+                    var sessionMsg = Activator.CreateInstance(sessionType, new EntitySessionEventArgs(player), msg)!;
+
+                    // We must be extremely specific to resolve the ambiguity. We want the generic RaiseEvent method
+                    // that takes two arguments, where the second argument is NOT a by-ref parameter.
+                    var method = typeof(IBroadcastEventBus).GetMethods()
+                        .Single(m =>
+                            m.Name == nameof(IBroadcastEventBus.RaiseEvent) &&
+                            m.IsGenericMethodDefinition &&
+                            m.GetParameters().Length == 2 &&
+                            !m.GetParameters()[1].ParameterType.IsByRef);
+
+                    var generic = method.MakeGenericMethod(sessionType);
+                    generic.Invoke(EventBus, new object[] { EventSource.Network, sessionMsg });
                 }
             }
 #if EXCEPTION_TOLERANCE
@@ -266,33 +280,42 @@ namespace Robust.Server.GameObjects
 #endif
         }
 
+        #endregion
+
+        #region Event Handlers and Helpers
+
         private void OnPlayerStatusChanged(object? sender, SessionStatusEventArgs args)
         {
             switch (args.NewStatus)
             {
                 case SessionStatus.Connected:
-                    _lastProcessedSequencesCmd.Add(args.Session, 0);
+                    _lastProcessedSequences.Add(args.Session, 0);
                     break;
 
                 case SessionStatus.Disconnected:
-                    _lastProcessedSequencesCmd.Remove(args.Session);
+                    _lastProcessedSequences.Remove(args.Session);
                     break;
             }
         }
 
+
         internal sealed class MessageSequenceComparer : IComparer<MsgEntity>
+
         {
             public int Compare(MsgEntity? x, MsgEntity? y)
             {
-                DebugTools.AssertNotNull(x);
-                DebugTools.AssertNotNull(y);
+                // Handle nulls gracefully.
+                if (x == null && y == null) return 0;
+                if (x == null) return 1;
+                if (y == null) return -1;
 
-                var cmp = y!.SourceTick.CompareTo(x!.SourceTick);
-                if (cmp != 0)
-                {
-                    return cmp;
-                }
+                // This is the CORRECT inverted logic. By comparing Y to X, we make the Max-Heap
+                // prioritize the item with the SMALLEST tick value, effectively turning it into a Min-Heap.
+                var tickCmp = y.SourceTick.CompareTo(x.SourceTick);
+                if (tickCmp != 0)
+                    return tickCmp;
 
+                // If ticks are equal, sort by sequence number (also inverted).
                 return y.Sequence.CompareTo(x.Sequence);
             }
         }

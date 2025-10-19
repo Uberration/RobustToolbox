@@ -1,14 +1,13 @@
-using Robust.Server.GameObjects;
-using Robust.Shared.Physics;
-using Robust.Shared.Physics.Systems;
+// Filename: Robust.Server/Physics/BroadphaseSystem.cs
 
 namespace Robust.Server.Physics
 {
-    internal sealed class BroadPhaseSystem : SharedBroadphaseSystem
+    public sealed class BroadphaseSystem : SharedBroadphaseSystem
     {
         public override void Initialize()
         {
             base.Initialize();
+            // Ensure broadphase runs before the main physics step.
             UpdatesBefore.Add(typeof(PhysicsSystem));
         }
     }

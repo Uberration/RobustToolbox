@@ -1,818 +1,691 @@
+// Filename: EntityManager.Network.cs
+
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using Robust.Shared.Map;
+using Robust.Shared.Network;
 using Robust.Shared.Utility;
 
-namespace Robust.Shared.GameObjects;
+#nullable enable
 
-public partial class EntityManager
+namespace Robust.Shared.GameObjects
 {
-    // TODO POOLING
-    // Just add overrides that take in an existing collection.
-
     /// <summary>
-    /// Inverse lookup for net entities.
-    /// Regular lookup uses MetadataComponent.
+    /// This partial class of EntityManager contains all logic related to networking,
+    /// including the translation between EntityUid, NetEntity, and their coordinate counterparts.
     /// </summary>
-    protected readonly Dictionary<NetEntity, (EntityUid, MetaDataComponent)> NetEntityLookup = new(EntityCapacity);
-
-    /// <summary>
-    /// Clears an old inverse lookup for a particular entityuid.
-    /// Do not call this unless you are sure of what you're doing.
-    /// </summary>
-    internal void ClearNetEntity(NetEntity netEntity)
+    public partial class EntityManager
     {
-        NetEntityLookup.Remove(netEntity);
-    }
+        #region Internal Network State and Management
 
-    /// <summary>
-    /// Set the inverse lookup for a particular entityuid.
-    /// Do not call this unless you are sure of what you're doing.
-    /// </summary>
-    internal void SetNetEntity(EntityUid uid, NetEntity netEntity, MetaDataComponent component)
-    {
-        DebugTools.Assert(component.NetEntity == NetEntity.Invalid || _netMan.IsClient);
-        DebugTools.Assert(!NetEntityLookup.ContainsKey(netEntity));
-        NetEntityLookup[netEntity] = (uid, component);
-        component.NetEntity = netEntity;
-    }
+        /// <summary>
+        /// Inverse lookup from a NetEntity to its corresponding EntityUid and MetaDataComponent.
+        /// </summary>
+        protected readonly Dictionary<NetEntity, (EntityUid, MetaDataComponent)> NetEntityLookup = new(EntityCapacity);
 
-    /// <inheritdoc />
-    public virtual bool IsClientSide(EntityUid uid, MetaDataComponent? metadata = null)
-    {
-        return false;
-    }
-
-    #region NetEntity
-
-    /// <inheritdoc />
-    public bool TryParseNetEntity(string arg, [NotNullWhen(true)] out EntityUid? entity)
-    {
-        if (!NetEntity.TryParse(arg, out var netEntity) ||
-            !TryGetEntity(netEntity, out entity))
+        /// <summary>
+        /// Clears an old inverse lookup for a particular entity.
+        /// Should only be called during entity deletion.
+        /// </summary>
+        internal void ClearNetEntity(NetEntity netEntity)
         {
+            NetEntityLookup.Remove(netEntity);
+        }
+
+        /// <summary>
+        /// Sets the inverse lookup for a newly created entity.
+        /// </summary>
+        internal void SetNetEntity(EntityUid uid, NetEntity netEntity, MetaDataComponent component)
+        {
+            DebugTools.Assert(component.NetEntity == NetEntity.Invalid || _netMan.IsClient);
+            DebugTools.Assert(!NetEntityLookup.ContainsKey(netEntity));
+            NetEntityLookup[netEntity] = (uid, component);
+            component.NetEntity = netEntity;
+        }
+
+        /// <inheritdoc />
+        public virtual bool IsClientSide(EntityUid uid, MetaDataComponent? metadata = null)
+        {
+            // This is false on the server. The client implementation overrides this to return true
+            // for client-side entities.
+            return false;
+        }
+
+        #endregion
+
+        #region NetEntity <-> EntityUid Translation
+
+        /// <inheritdoc />
+        public bool TryParseNetEntity(string arg, [NotNullWhen(true)] out EntityUid? entity)
+        {
+            if (!NetEntity.TryParse(arg, out var netEntity) || !TryGetEntity(netEntity, out entity))
+            {
+                entity = null;
+                return false;
+            }
+            return true;
+        }
+
+        /// <inheritdoc />
+        public bool TryGetEntity(NetEntity nEntity, [NotNullWhen(true)] out EntityUid? entity)
+        {
+            if (NetEntityLookup.TryGetValue(nEntity, out var went))
+            {
+                entity = went.Item1;
+                return true;
+            }
+
             entity = null;
             return false;
         }
 
-        return true;
-    }
-
-    /// <inheritdoc />
-    public bool TryGetEntity(NetEntity nEntity, [NotNullWhen(true)] out EntityUid? entity)
-    {
-        if (NetEntityLookup.TryGetValue(nEntity, out var went))
+        /// <inheritdoc />
+        public bool TryGetEntityData(NetEntity nEntity, [NotNullWhen(true)] out EntityUid? entity, [NotNullWhen(true)] out MetaDataComponent? meta)
         {
-            entity = went.Item1;
-            return true;
-        }
+            if (NetEntityLookup.TryGetValue(nEntity, out var went))
+            {
+                entity = went.Item1;
+                meta = went.Item2;
+                return true;
+            }
 
-        entity = null;
-        return false;
-    }
-
-    /// <inheritdoc />
-    public bool TryGetEntityData(NetEntity nEntity, [NotNullWhen(true)] out EntityUid? entity, [NotNullWhen(true)] out MetaDataComponent? meta)
-    {
-        if (NetEntityLookup.TryGetValue(nEntity, out var went))
-        {
-            entity = went.Item1;
-            meta = went.Item2;
-            return true;
-        }
-
-        entity = null;
-        meta = null;
-        return false;
-    }
-
-    /// <inheritdoc />
-    public bool TryGetEntity(NetEntity? nEntity, [NotNullWhen(true)] out EntityUid? entity)
-    {
-        if (nEntity == null)
-        {
             entity = null;
+            meta = null;
             return false;
         }
 
-        return TryGetEntity(nEntity.Value, out entity);
-    }
-
-    /// <inheritdoc />
-    public bool TryGetNetEntity(EntityUid uid, [NotNullWhen(true)] out NetEntity? netEntity, MetaDataComponent? metadata = null)
-    {
-        if (uid == EntityUid.Invalid)
+        /// <inheritdoc />
+        public bool TryGetEntity(NetEntity? nEntity, [NotNullWhen(true)] out EntityUid? entity)
         {
+            if (nEntity == null)
+            {
+                entity = null;
+                return false;
+            }
+            return TryGetEntity(nEntity.Value, out entity);
+        }
+
+        /// <inheritdoc />
+        public bool TryGetNetEntity(EntityUid uid, [NotNullWhen(true)] out NetEntity? netEntity, MetaDataComponent? metadata = null)
+        {
+            if (MetaQuery.TryGetComponent(uid, out metadata))
+            {
+                netEntity = metadata.NetEntity;
+                return true;
+            }
+
             netEntity = null;
             return false;
         }
 
-        // TODO NetEntity figure out why this happens
-        // I wanted this to logMissing but it seems to break a loootttt of dodgy stuff on content.
-        if (MetaQuery.Resolve(uid, ref metadata, false))
+        /// <inheritdoc />
+        public bool TryGetNetEntity(EntityUid? uid, [NotNullWhen(true)] out NetEntity? netEntity, MetaDataComponent? metadata = null)
         {
-            netEntity = metadata.NetEntity;
-            return true;
+            if (uid == null)
+            {
+                netEntity = null;
+                return false;
+            }
+            return TryGetNetEntity(uid.Value, out netEntity, metadata);
         }
 
-        netEntity = NetEntity.Invalid;
-        return false;
-    }
-
-    /// <inheritdoc />
-    public bool TryGetNetEntity(EntityUid? uid, [NotNullWhen(true)] out NetEntity? netEntity, MetaDataComponent? metadata = null)
-    {
-        if (uid == null)
+        /// <inheritdoc />
+        public EntityUid GetEntity(NetEntity nEntity)
         {
-            netEntity = null;
-            return false;
-        }
+            if (NetEntityLookup.TryGetValue(nEntity, out var tuple))
+                return tuple.Item1;
 
-        return TryGetNetEntity(uid.Value, out netEntity, metadata);
-    }
-
-    /// <inheritdoc />
-    public virtual EntityUid EnsureEntity<T>(NetEntity nEntity, EntityUid callerEntity)
-    {
-        // On server we don't want to ensure any reserved entities for later or flag for comp state handling
-        // so this is just GetEntity. Client-side code overrides this method.
-        return GetEntity(nEntity);
-    }
-
-    /// <inheritdoc />
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public EntityUid? EnsureEntity<T>(NetEntity? nEntity, EntityUid callerEntity)
-    {
-        if (nEntity == null)
-            return null;
-
-        return EnsureEntity<T>(nEntity.Value, callerEntity);
-    }
-
-    /// <inheritdoc />
-    public EntityUid GetEntity(NetEntity nEntity)
-    {
-        if (nEntity == NetEntity.Invalid)
             return EntityUid.Invalid;
+        }
 
-        if (!NetEntityLookup.TryGetValue(nEntity, out var tuple))
-            return EntityUid.Invalid;
+        public (EntityUid, MetaDataComponent) GetEntityData(NetEntity nEntity) => NetEntityLookup[nEntity];
 
-        return tuple.Item1;
-    }
+        /// <inheritdoc />
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public EntityUid? GetEntity(NetEntity? nEntity)
+        {
+            if (nEntity == null)
+                return null;
 
-    public (EntityUid, MetaDataComponent) GetEntityData(NetEntity nEntity)
-    {
-        return NetEntityLookup[nEntity];
-    }
+            return GetEntity(nEntity.Value);
+        }
 
-    /// <inheritdoc />
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public EntityUid? GetEntity(NetEntity? nEntity)
-    {
-        if (nEntity == null)
-            return null;
+        /// <inheritdoc />
+        public NetEntity GetNetEntity(EntityUid uid)
+        {
+            if (TryGetNetEntity(uid, out var netEntity))
+                return netEntity.Value;
 
-        return GetEntity(nEntity.Value);
-    }
-
-    /// <inheritdoc />
-    public NetEntity GetNetEntity(EntityUid uid, MetaDataComponent? metadata = null)
-    {
-        if (uid == EntityUid.Invalid)
             return NetEntity.Invalid;
+        }
 
-        if (!MetaQuery.Resolve(uid, ref metadata))
+        /// <inheritdoc />
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public NetEntity? GetNetEntity(EntityUid? uid)
+        {
+            if (uid == null)
+                return null;
+
+            return GetNetEntity(uid.Value);
+        }
+
+        /// <summary>
+        /// A specialized, multi-thread safe version of GetNetEntity used during game state serialization.
+        /// It is robust against the entity being deleted by another thread during processing.
+        /// </summary>
+        public NetEntity GetNetEntity(EntityUid uid, MetaDataComponent? metadata)
+        {
+            // CRITICAL FIX: This method is now race-condition-proof.
+            // If the entity is deleted by another thread while PVS is processing,
+            // this will safely return NetEntity.Invalid instead of crashing.
+            if (MetaQuery.TryGetComponent(uid, out metadata))
+                return metadata.NetEntity;
+
             return NetEntity.Invalid;
-
-        return metadata.NetEntity;
-    }
-
-    /// <inheritdoc />
-    public NetEntity? GetNetEntity(EntityUid? uid, MetaDataComponent? metadata = null)
-    {
-        if (uid == null)
-            return null;
-
-        return GetNetEntity(uid.Value, metadata);
-    }
-
-    #endregion
-
-    #region NetCoordinates
-
-    /// <inheritdoc />
-    public NetCoordinates GetNetCoordinates(EntityCoordinates coordinates, MetaDataComponent? metadata = null)
-    {
-        return new NetCoordinates(GetNetEntity(coordinates.EntityId, metadata), coordinates.Position);
-    }
-
-    /// <inheritdoc />
-    public NetCoordinates? GetNetCoordinates(EntityCoordinates? coordinates, MetaDataComponent? metadata = null)
-    {
-        if (coordinates == null)
-            return null;
-
-        return new NetCoordinates(GetNetEntity(coordinates.Value.EntityId, metadata), coordinates.Value.Position);
-    }
-
-    /// <inheritdoc />
-    public EntityCoordinates GetCoordinates(NetCoordinates coordinates)
-    {
-        return new EntityCoordinates(GetEntity(coordinates.NetEntity), coordinates.Position);
-    }
-
-    /// <inheritdoc />
-    public EntityCoordinates? GetCoordinates(NetCoordinates? coordinates)
-    {
-        if (coordinates == null)
-            return null;
-
-        return new EntityCoordinates(GetEntity(coordinates.Value.NetEntity), coordinates.Value.Position);
-    }
-
-    /// <inheritdoc />
-    public virtual EntityCoordinates EnsureCoordinates<T>(NetCoordinates netCoordinates, EntityUid callerEntity)
-    {
-        // See EnsureEntity
-        return GetCoordinates(netCoordinates);
-    }
-
-    /// <inheritdoc />
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public EntityCoordinates? EnsureCoordinates<T>(NetCoordinates? netCoordinates, EntityUid callerEntity)
-    {
-        if (netCoordinates == null)
-            return null;
-
-        return EnsureCoordinates<T>(netCoordinates.Value, callerEntity);
-    }
-
-    #endregion
-
-    #region Collection helpers
-
-    /// <inheritdoc />
-    public HashSet<EntityUid> GetEntitySet(HashSet<NetEntity> netEntities)
-    {
-        var entities = new HashSet<EntityUid>(netEntities.Count);
-
-        foreach (var netEntity in netEntities)
-        {
-            entities.Add(GetEntity(netEntity));
         }
 
-        return entities;
-    }
-
-    /// <inheritdoc />
-    public List<EntityUid> GetEntityList(List<NetEntity> netEntities)
-    {
-        var entities = new List<EntityUid>(netEntities.Count);
-
-        foreach (var netEntity in netEntities)
+        [return: NotNullIfNotNull("uid")]
+        public NetEntity? GetNetEntity(EntityUid? uid, MetaDataComponent? metadata)
         {
-            entities.Add(GetEntity(netEntity));
+            if (uid == null)
+                return null;
+
+            return GetNetEntity(uid.Value, metadata);
         }
 
-        return entities;
-    }
+        #endregion
 
-    public Dictionary<EntityUid, T> GetEntityDictionary<T>(Dictionary<NetEntity, T> netEntities)
-    {
-        var entities = new Dictionary<EntityUid, T>(netEntities.Count);
+        #region NetCoordinates <-> EntityCoordinates Translation
 
-        foreach (var pair in netEntities)
+        /// <inheritdoc />
+        public NetCoordinates GetNetCoordinates(EntityCoordinates coordinates, MetaDataComponent? metadata = null)
         {
-            entities.Add(GetEntity(pair.Key), pair.Value);
+            // Pass the metadata hint to the GetNetEntity call for correctness.
+            return new NetCoordinates(GetNetEntity(coordinates.EntityId, metadata), coordinates.Position);
         }
 
-        return entities;
-    }
-
-    public Dictionary<T, EntityUid> GetEntityDictionary<T>(Dictionary<T, NetEntity> netEntities) where T : notnull
-    {
-        var entities = new Dictionary<T, EntityUid>(netEntities.Count);
-
-        foreach (var pair in netEntities)
+        /// <inheritdoc />
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public NetCoordinates? GetNetCoordinates(EntityCoordinates? coordinates, MetaDataComponent? metadata = null)
         {
-            entities.Add(pair.Key, GetEntity(pair.Value));
+            if (coordinates == null)
+                return null;
+
+            // Call the correct overload that accepts the metadata hint.
+            return GetNetCoordinates(coordinates.Value, metadata);
         }
 
-        return entities;
-    }
-
-    public Dictionary<T, EntityUid?> GetEntityDictionary<T>(Dictionary<T, NetEntity?> netEntities) where T : notnull
-    {
-        var entities = new Dictionary<T, EntityUid?>(netEntities.Count);
-
-        foreach (var pair in netEntities)
+        /// <inheritdoc />
+        public EntityCoordinates GetCoordinates(NetCoordinates coordinates)
         {
-            entities.Add(pair.Key, GetEntity(pair.Value));
+            return new EntityCoordinates(GetEntity(coordinates.NetEntity), coordinates.Position);
         }
 
-        return entities;
-    }
-
-    public Dictionary<EntityUid, EntityUid> GetEntityDictionary(Dictionary<NetEntity, NetEntity> netEntities)
-    {
-        var entities = new Dictionary<EntityUid, EntityUid>(netEntities.Count);
-
-        foreach (var pair in netEntities)
+        /// <inheritdoc />
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public EntityCoordinates? GetCoordinates(NetCoordinates? coordinates)
         {
-            entities.Add(GetEntity(pair.Key), GetEntity(pair.Value));
+            if (coordinates == null)
+                return null;
+
+            return GetCoordinates(coordinates.Value);
         }
 
-        return entities;
-    }
+        #endregion
 
-    public Dictionary<EntityUid, EntityUid?> GetEntityDictionary(Dictionary<NetEntity, NetEntity?> netEntities)
-    {
-        var entities = new Dictionary<EntityUid, EntityUid?>(netEntities.Count);
+        #region Client-side "Ensure" Methods
 
-        foreach (var pair in netEntities)
+        /// <inheritdoc />
+        public virtual EntityUid EnsureEntity<T>(NetEntity nEntity, EntityUid callerEntity)
         {
-            entities.Add(GetEntity(pair.Key), GetEntity(pair.Value));
+            // On the server, we don't need to "ensure" anything; the entity either exists or it doesn't.
+            // The client overrides this with logic to handle pending entity states.
+            return GetEntity(nEntity);
         }
 
-        return entities;
-    }
-
-    public HashSet<EntityUid> EnsureEntitySet<T>(HashSet<NetEntity> netEntities, EntityUid callerEntity)
-    {
-        var entities = new HashSet<EntityUid>(netEntities.Count);
-
-        foreach (var netEntity in netEntities)
+        /// <inheritdoc />
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public EntityUid? EnsureEntity<T>(NetEntity? nEntity, EntityUid callerEntity)
         {
-            entities.Add(EnsureEntity<T>(netEntity, callerEntity));
+            if (nEntity == null)
+                return null;
+
+            return EnsureEntity<T>(nEntity.Value, callerEntity);
         }
 
-        return entities;
-    }
-
-    public void EnsureEntitySet<T>(HashSet<NetEntity> netEntities, EntityUid callerEntity, HashSet<EntityUid> entities)
-    {
-        entities.Clear();
-        entities.EnsureCapacity(netEntities.Count);
-        foreach (var netEntity in netEntities)
+        /// <inheritdoc />
+        public virtual EntityCoordinates EnsureCoordinates<T>(NetCoordinates netCoordinates, EntityUid callerEntity)
         {
-            entities.Add(EnsureEntity<T>(netEntity, callerEntity));
-        }
-    }
-
-    /// <inheritdoc />
-    public List<EntityUid> EnsureEntityList<T>(List<NetEntity> netEntities, EntityUid callerEntity)
-    {
-        var entities = new List<EntityUid>(netEntities.Count);
-
-        foreach (var netEntity in netEntities)
-        {
-            entities.Add(EnsureEntity<T>(netEntity, callerEntity));
+            // See EnsureEntity for explanation.
+            return GetCoordinates(netCoordinates);
         }
 
-        return entities;
-    }
-
-    public void EnsureEntityList<T>(List<NetEntity> netEntities, EntityUid callerEntity, List<EntityUid> entities)
-    {
-        entities.Clear();
-        entities.EnsureCapacity(netEntities.Count);
-        foreach (var netEntity in netEntities)
+        /// <inheritdoc />
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public EntityCoordinates? EnsureCoordinates<T>(NetCoordinates? netCoordinates, EntityUid callerEntity)
         {
-            entities.Add(EnsureEntity<T>(netEntity, callerEntity));
-        }
-    }
+            if (netCoordinates == null)
+                return null;
 
-    public void EnsureEntityDictionary<TComp, TValue>(Dictionary<NetEntity, TValue> netEntities, EntityUid callerEntity,
-        Dictionary<EntityUid, TValue> entities)
-    {
-        entities.Clear();
-        entities.EnsureCapacity(netEntities.Count);
-        foreach (var pair in netEntities)
-        {
-            entities.TryAdd(EnsureEntity<TComp>(pair.Key, callerEntity), pair.Value);
-        }
-    }
-
-    public void EnsureEntityDictionaryNullableValue<TComp, TValue>(Dictionary<NetEntity, TValue?> netEntities, EntityUid callerEntity,
-        Dictionary<EntityUid, TValue?> entities)
-    {
-        entities.Clear();
-        entities.EnsureCapacity(netEntities.Count);
-        foreach (var pair in netEntities)
-        {
-            entities.TryAdd(EnsureEntity<TComp>(pair.Key, callerEntity), pair.Value);
-        }
-    }
-
-    public void EnsureEntityDictionary<TComp, TKey>(Dictionary<TKey, NetEntity> netEntities, EntityUid callerEntity,
-        Dictionary<TKey, EntityUid> entities) where TKey : notnull
-    {
-        entities.Clear();
-        entities.EnsureCapacity(netEntities.Count);
-        foreach (var pair in netEntities)
-        {
-            entities.TryAdd(pair.Key, EnsureEntity<TComp>(pair.Value, callerEntity));
-        }
-    }
-
-    public void EnsureEntityDictionary<TComp, TKey>(Dictionary<TKey, NetEntity?> netEntities, EntityUid callerEntity,
-        Dictionary<TKey, EntityUid?> entities) where TKey : notnull
-    {
-        entities.Clear();
-        entities.EnsureCapacity(netEntities.Count);
-        foreach (var pair in netEntities)
-        {
-            entities.TryAdd(pair.Key, EnsureEntity<TComp>(pair.Value, callerEntity));
-        }
-    }
-
-    public void EnsureEntityDictionary<TComp>(Dictionary<NetEntity, NetEntity> netEntities, EntityUid callerEntity,
-        Dictionary<EntityUid, EntityUid> entities)
-    {
-        entities.Clear();
-        entities.EnsureCapacity(netEntities.Count);
-        foreach (var pair in netEntities)
-        {
-            entities.TryAdd(EnsureEntity<TComp>(pair.Key, callerEntity), EnsureEntity<TComp>(pair.Value, callerEntity));
-        }
-    }
-
-    public void EnsureEntityDictionary<TComp>(Dictionary<NetEntity, NetEntity?> netEntities, EntityUid callerEntity,
-        Dictionary<EntityUid, EntityUid?> entities)
-    {
-        entities.Clear();
-        entities.EnsureCapacity(netEntities.Count);
-        foreach (var pair in netEntities)
-        {
-            entities.TryAdd(EnsureEntity<TComp>(pair.Key, callerEntity), EnsureEntity<TComp>(pair.Value, callerEntity));
-        }
-    }
-
-    /// <inheritdoc />
-    public List<EntityUid> GetEntityList(ICollection<NetEntity> netEntities)
-    {
-        var entities = new List<EntityUid>(netEntities.Count);
-        foreach (var netEntity in netEntities)
-        {
-            entities.Add(GetEntity(netEntity));
+            return EnsureCoordinates<T>(netCoordinates.Value, callerEntity);
         }
 
-        return entities;
-    }
+        #endregion
 
-    /// <inheritdoc />
-    public List<EntityUid?> GetEntityList(List<NetEntity?> netEntities)
-    {
-        var entities = new List<EntityUid?>(netEntities.Count);
+        #region Collection Conversion Helpers
 
-        foreach (var netEntity in netEntities)
+        #region GetEntity Collections (NetEntity -> EntityUid)
+
+        /// <inheritdoc />
+        public HashSet<EntityUid> GetEntitySet(HashSet<NetEntity> netEntities)
         {
-            entities.Add(GetEntity(netEntity));
+            var entities = new HashSet<EntityUid>(netEntities.Count);
+            foreach (var netEntity in netEntities)
+                entities.Add(GetEntity(netEntity));
+            return entities;
         }
 
-        return entities;
-    }
-
-    /// <inheritdoc />
-    public EntityUid[] GetEntityArray(NetEntity[] netEntities)
-    {
-        var entities = new EntityUid[netEntities.Length];
-
-        for (var i = 0; i < netEntities.Length; i++)
+        /// <inheritdoc />
+        public List<EntityUid> GetEntityList(List<NetEntity> netEntities)
         {
-            entities[i] = GetEntity(netEntities[i]);
+            var entities = new List<EntityUid>(netEntities.Count);
+            foreach (var netEntity in netEntities)
+                entities.Add(GetEntity(netEntity));
+            return entities;
         }
 
-        return entities;
-    }
-
-    /// <inheritdoc />
-    public EntityUid?[] GetEntityArray(NetEntity?[] netEntities)
-    {
-        var entities = new EntityUid?[netEntities.Length];
-
-        for (var i = 0; i < netEntities.Length; i++)
+        public Dictionary<EntityUid, T> GetEntityDictionary<T>(Dictionary<NetEntity, T> netEntities)
         {
-            entities[i] = GetEntity(netEntities[i]);
+            var entities = new Dictionary<EntityUid, T>(netEntities.Count);
+            foreach (var (key, value) in netEntities)
+                entities.Add(GetEntity(key), value);
+            return entities;
         }
 
-        return entities;
-    }
-
-    /// <inheritdoc />
-    public HashSet<NetEntity> GetNetEntitySet(HashSet<EntityUid> entities)
-    {
-        var newSet = new HashSet<NetEntity>(entities.Count);
-
-        foreach (var ent in entities)
+        public Dictionary<T, EntityUid> GetEntityDictionary<T>(Dictionary<T, NetEntity> netEntities) where T : notnull
         {
-            MetaQuery.TryGetComponent(ent, out var metadata);
-            newSet.Add(GetNetEntity(ent, metadata));
+            var entities = new Dictionary<T, EntityUid>(netEntities.Count);
+            foreach (var (key, value) in netEntities)
+                entities.Add(key, GetEntity(value));
+            return entities;
         }
 
-        return newSet;
-    }
-
-    /// <inheritdoc />
-    public List<NetEntity> GetNetEntityList(List<EntityUid> entities)
-    {
-        var netEntities = new List<NetEntity>(entities.Count);
-
-        foreach (var netEntity in entities)
+        public Dictionary<T, EntityUid?> GetEntityDictionary<T>(Dictionary<T, NetEntity?> netEntities) where T : notnull
         {
-            netEntities.Add(GetNetEntity(netEntity));
+            var entities = new Dictionary<T, EntityUid?>(netEntities.Count);
+            foreach (var (key, value) in netEntities)
+                entities.Add(key, GetEntity(value));
+            return entities;
         }
 
-        return netEntities;
-    }
-
-    /// <inheritdoc />
-    public List<NetEntity> GetNetEntityList(IReadOnlyList<EntityUid> entities)
-    {
-        var netEntities = new List<NetEntity>(entities.Count);
-
-        foreach (var netEntity in entities)
+        public Dictionary<EntityUid, EntityUid> GetEntityDictionary(Dictionary<NetEntity, NetEntity> netEntities)
         {
-            netEntities.Add(GetNetEntity(netEntity));
+            var entities = new Dictionary<EntityUid, EntityUid>(netEntities.Count);
+            foreach (var (key, value) in netEntities)
+                entities.Add(GetEntity(key), GetEntity(value));
+            return entities;
         }
 
-        return netEntities;
-    }
-
-    /// <inheritdoc />
-    public List<NetEntity> GetNetEntityList(ICollection<EntityUid> entities)
-    {
-        var netEntities = new List<NetEntity>(entities.Count);
-
-        foreach (var netEntity in entities)
+        public Dictionary<EntityUid, EntityUid?> GetEntityDictionary(Dictionary<NetEntity, NetEntity?> netEntities)
         {
-            netEntities.Add(GetNetEntity(netEntity));
+            var entities = new Dictionary<EntityUid, EntityUid?>(netEntities.Count);
+            foreach (var (key, value) in netEntities)
+                entities.Add(GetEntity(key), GetEntity(value));
+            return entities;
         }
 
-        return netEntities;
-    }
-
-    /// <inheritdoc />
-    public List<NetEntity?> GetNetEntityList(List<EntityUid?> entities)
-    {
-        var netEntities = new List<NetEntity?>(entities.Count);
-
-        foreach (var netEntity in entities)
+        /// <inheritdoc />
+        public List<EntityUid> GetEntityList(ICollection<NetEntity> netEntities)
         {
-            netEntities.Add(GetNetEntity(netEntity));
+            var entities = new List<EntityUid>(netEntities.Count);
+            foreach (var netEntity in netEntities)
+                entities.Add(GetEntity(netEntity));
+            return entities;
         }
 
-        return netEntities;
-    }
-
-    /// <inheritdoc />
-    public NetEntity[] GetNetEntityArray(EntityUid[] entities)
-    {
-        var netEntities = new NetEntity[entities.Length];
-
-        for (var i = 0; i < entities.Length; i++)
+        /// <inheritdoc />
+        public List<EntityUid?> GetEntityList(List<NetEntity?> netEntities)
         {
-            netEntities[i] = GetNetEntity(entities[i]);
+            var entities = new List<EntityUid?>(netEntities.Count);
+            foreach (var netEntity in netEntities)
+                entities.Add(GetEntity(netEntity));
+            return entities;
         }
 
-        return netEntities;
-    }
-
-    /// <inheritdoc />
-    public NetEntity?[] GetNetEntityArray(EntityUid?[] entities)
-    {
-        var netEntities = new NetEntity?[entities.Length];
-
-        for (var i = 0; i < entities.Length; i++)
+        /// <inheritdoc />
+        public EntityUid[] GetEntityArray(NetEntity[] netEntities)
         {
-            netEntities[i] = GetNetEntity(entities[i]);
+            var entities = new EntityUid[netEntities.Length];
+            for (var i = 0; i < netEntities.Length; i++)
+                entities[i] = GetEntity(netEntities[i]);
+            return entities;
         }
 
-        return netEntities;
-    }
-
-    /// <inheritdoc />
-    public Dictionary<NetEntity, T> GetNetEntityDictionary<T>(Dictionary<EntityUid, T> entities)
-    {
-        var netEntities = new Dictionary<NetEntity, T>(entities.Count);
-
-        foreach (var pair in entities)
+        /// <inheritdoc />
+        public EntityUid?[] GetEntityArray(NetEntity?[] netEntities)
         {
-            netEntities.Add(GetNetEntity(pair.Key), pair.Value);
+            var entities = new EntityUid?[netEntities.Length];
+            for (var i = 0; i < netEntities.Length; i++)
+                entities[i] = GetEntity(netEntities[i]);
+            return entities;
         }
 
-        return netEntities;
-    }
+        #endregion
 
-    /// <inheritdoc />
-    public Dictionary<T, NetEntity> GetNetEntityDictionary<T>(Dictionary<T, EntityUid> entities) where T : notnull
-    {
-        var netEntities = new Dictionary<T, NetEntity>(entities.Count);
+        #region EnsureEntity Collections (Client Prediction)
 
-        foreach (var pair in entities)
+        public HashSet<EntityUid> EnsureEntitySet<T>(HashSet<NetEntity> netEntities, EntityUid callerEntity)
         {
-            netEntities.Add(pair.Key, GetNetEntity(pair.Value));
+            var entities = new HashSet<EntityUid>(netEntities.Count);
+            foreach (var netEntity in netEntities)
+                entities.Add(EnsureEntity<T>(netEntity, callerEntity));
+            return entities;
         }
 
-        return netEntities;
-    }
-
-    /// <inheritdoc />
-    public Dictionary<T, NetEntity?> GetNetEntityDictionary<T>(Dictionary<T, EntityUid?> entities) where T : notnull
-    {
-        var netEntities = new Dictionary<T, NetEntity?>(entities.Count);
-
-        foreach (var pair in entities)
+        public void EnsureEntitySet<T>(HashSet<NetEntity> netEntities, EntityUid callerEntity, HashSet<EntityUid> entities)
         {
-            netEntities.Add(pair.Key, GetNetEntity(pair.Value));
+            entities.Clear();
+            entities.EnsureCapacity(netEntities.Count);
+            foreach (var netEntity in netEntities)
+                entities.Add(EnsureEntity<T>(netEntity, callerEntity));
         }
 
-        return netEntities;
-    }
-
-    /// <inheritdoc />
-    public Dictionary<NetEntity, NetEntity> GetNetEntityDictionary(Dictionary<EntityUid, EntityUid> entities)
-    {
-        var netEntities = new Dictionary<NetEntity, NetEntity>(entities.Count);
-
-        foreach (var pair in entities)
+        /// <inheritdoc />
+        public List<EntityUid> EnsureEntityList<T>(List<NetEntity> netEntities, EntityUid callerEntity)
         {
-            netEntities.Add(GetNetEntity(pair.Key), GetNetEntity(pair.Value));
+            var entities = new List<EntityUid>(netEntities.Count);
+            foreach (var netEntity in netEntities)
+                entities.Add(EnsureEntity<T>(netEntity, callerEntity));
+            return entities;
         }
 
-        return netEntities;
-    }
-
-    /// <inheritdoc />
-    public Dictionary<NetEntity, NetEntity?> GetNetEntityDictionary(Dictionary<EntityUid, EntityUid?> entities)
-    {
-        var netEntities = new Dictionary<NetEntity, NetEntity?>(entities.Count);
-
-        foreach (var pair in entities)
+        public void EnsureEntityList<T>(List<NetEntity> netEntities, EntityUid callerEntity, List<EntityUid> entities)
         {
-            netEntities.Add(GetNetEntity(pair.Key), GetNetEntity(pair.Value));
+            entities.Clear();
+            entities.EnsureCapacity(netEntities.Count);
+            foreach (var netEntity in netEntities)
+                entities.Add(EnsureEntity<T>(netEntity, callerEntity));
         }
 
-        return netEntities;
-    }
-
-    /// <inheritdoc />
-    public HashSet<EntityCoordinates> GetEntitySet(HashSet<NetCoordinates> netEntities)
-    {
-        var entities = new HashSet<EntityCoordinates>(netEntities.Count);
-
-        foreach (var netCoordinates in netEntities)
+        public void EnsureEntityDictionary<TComp, TValue>(Dictionary<NetEntity, TValue> netEntities, EntityUid callerEntity, Dictionary<EntityUid, TValue> entities)
         {
-            entities.Add(GetCoordinates(netCoordinates));
+            entities.Clear();
+            entities.EnsureCapacity(netEntities.Count);
+            foreach (var (key, value) in netEntities)
+                entities.TryAdd(EnsureEntity<TComp>(key, callerEntity), value);
         }
 
-        return entities;
-    }
-
-    /// <inheritdoc />
-    public List<EntityCoordinates> GetEntityList(List<NetCoordinates> netEntities)
-    {
-        var entities = new List<EntityCoordinates>(netEntities.Count);
-
-        foreach (var netCoordinates in netEntities)
+        public void EnsureEntityDictionaryNullableValue<TComp, TValue>(Dictionary<NetEntity, TValue?> netEntities, EntityUid callerEntity, Dictionary<EntityUid, TValue?> entities)
         {
-            entities.Add(GetCoordinates(netCoordinates));
+            entities.Clear();
+            entities.EnsureCapacity(netEntities.Count);
+            foreach (var (key, value) in netEntities)
+                entities.TryAdd(EnsureEntity<TComp>(key, callerEntity), value);
         }
 
-        return entities;
-    }
-
-    /// <inheritdoc />
-    public List<EntityCoordinates> GetEntityList(ICollection<NetCoordinates> netEntities)
-    {
-        var entities = new List<EntityCoordinates>(netEntities.Count);
-
-        foreach (var netCoordinates in netEntities)
+        public void EnsureEntityDictionary<TComp, TKey>(Dictionary<TKey, NetEntity> netEntities, EntityUid callerEntity, Dictionary<TKey, EntityUid> entities) where TKey : notnull
         {
-            entities.Add(GetCoordinates(netCoordinates));
+            entities.Clear();
+            entities.EnsureCapacity(netEntities.Count);
+            foreach (var (key, value) in netEntities)
+                entities.TryAdd(key, EnsureEntity<TComp>(value, callerEntity));
         }
 
-        return entities;
-    }
-
-    /// <inheritdoc />
-    public List<EntityCoordinates?> GetEntityList(List<NetCoordinates?> netEntities)
-    {
-        var entities = new List<EntityCoordinates?>(netEntities.Count);
-
-        foreach (var netCoordinates in netEntities)
+        public void EnsureEntityDictionary<TComp, TKey>(Dictionary<TKey, NetEntity?> netEntities, EntityUid callerEntity, Dictionary<TKey, EntityUid?> entities) where TKey : notnull
         {
-            entities.Add(GetCoordinates(netCoordinates));
+            entities.Clear();
+            entities.EnsureCapacity(netEntities.Count);
+            foreach (var (key, value) in netEntities)
+                entities.TryAdd(key, EnsureEntity<TComp>(value, callerEntity));
         }
 
-        return entities;
-    }
-
-    /// <inheritdoc />
-    public EntityCoordinates[] GetEntityArray(NetCoordinates[] netEntities)
-    {
-        var entities = new EntityCoordinates[netEntities.Length];
-
-        for (var i = 0; i < netEntities.Length; i++)
+        public void EnsureEntityDictionary<TComp>(Dictionary<NetEntity, NetEntity> netEntities, EntityUid callerEntity, Dictionary<EntityUid, EntityUid> entities)
         {
-            entities[i] = GetCoordinates(netEntities[i]);
+            entities.Clear();
+            entities.EnsureCapacity(netEntities.Count);
+            foreach (var (key, value) in netEntities)
+                entities.TryAdd(EnsureEntity<TComp>(key, callerEntity), EnsureEntity<TComp>(value, callerEntity));
         }
 
-        return entities;
-    }
-
-    /// <inheritdoc />
-    public EntityCoordinates?[] GetEntityArray(NetCoordinates?[] netEntities)
-    {
-        var entities = new EntityCoordinates?[netEntities.Length];
-
-        for (var i = 0; i < netEntities.Length; i++)
+        public void EnsureEntityDictionary<TComp>(Dictionary<NetEntity, NetEntity?> netEntities, EntityUid callerEntity, Dictionary<EntityUid, EntityUid?> entities)
         {
-            entities[i] = GetCoordinates(netEntities[i]);
+            entities.Clear();
+            entities.EnsureCapacity(netEntities.Count);
+            foreach (var (key, value) in netEntities)
+                entities.TryAdd(EnsureEntity<TComp>(key, callerEntity), EnsureEntity<TComp>(value, callerEntity));
         }
 
-        return entities;
-    }
+        #endregion
 
-    /// <inheritdoc />
-    public HashSet<NetCoordinates> GetNetCoordinatesSet(HashSet<EntityCoordinates> entities)
-    {
-        var newSet = new HashSet<NetCoordinates>(entities.Count);
+        #region GetNetEntity Collections (EntityUid -> NetEntity)
 
-        foreach (var coordinates in entities)
+        /// <inheritdoc />
+        public HashSet<NetEntity> GetNetEntitySet(HashSet<EntityUid> entities)
         {
-            newSet.Add(GetNetCoordinates(coordinates));
+            var newSet = new HashSet<NetEntity>(entities.Count);
+            foreach (var ent in entities)
+                newSet.Add(GetNetEntity(ent));
+            return newSet;
         }
 
-        return newSet;
-    }
-
-    /// <inheritdoc />
-    public List<NetCoordinates> GetNetCoordinatesList(List<EntityCoordinates> entities)
-    {
-        var netEntities = new List<NetCoordinates>(entities.Count);
-
-        foreach (var netCoordinates in entities)
+        /// <inheritdoc />
+        public List<NetEntity> GetNetEntityList(List<EntityUid> entities)
         {
-            netEntities.Add(GetNetCoordinates(netCoordinates));
+            var netEntities = new List<NetEntity>(entities.Count);
+            foreach (var entity in entities)
+                netEntities.Add(GetNetEntity(entity));
+            return netEntities;
         }
 
-        return netEntities;
-    }
-
-    /// <inheritdoc />
-    public List<NetCoordinates> GetNetCoordinatesList(ICollection<EntityCoordinates> entities)
-    {
-        var netEntities = new List<NetCoordinates>(entities.Count);
-
-        foreach (var netCoordinates in entities)
+        /// <inheritdoc />
+        public List<NetEntity> GetNetEntityList(IReadOnlyList<EntityUid> entities)
         {
-            netEntities.Add(GetNetCoordinates(netCoordinates));
+            var netEntities = new List<NetEntity>(entities.Count);
+            foreach (var entity in entities)
+                netEntities.Add(GetNetEntity(entity));
+            return netEntities;
         }
 
-        return netEntities;
-    }
-
-    /// <inheritdoc />
-    public List<NetCoordinates?> GetNetCoordinatesList(List<EntityCoordinates?> entities)
-    {
-        var netEntities = new List<NetCoordinates?>(entities.Count);
-
-        foreach (var netCoordinates in entities)
+        /// <inheritdoc />
+        public List<NetEntity> GetNetEntityList(ICollection<EntityUid> entities)
         {
-            netEntities.Add(GetNetCoordinates(netCoordinates));
+            var netEntities = new List<NetEntity>(entities.Count);
+            foreach (var entity in entities)
+                netEntities.Add(GetNetEntity(entity));
+            return netEntities;
         }
 
-        return netEntities;
-    }
-
-    /// <inheritdoc />
-    public NetCoordinates[] GetNetCoordinatesArray(EntityCoordinates[] entities)
-    {
-        var netEntities = new NetCoordinates[entities.Length];
-
-        for (var i = 0; i < entities.Length; i++)
+        /// <inheritdoc />
+        public List<NetEntity?> GetNetEntityList(List<EntityUid?> entities)
         {
-            netEntities[i] = GetNetCoordinates(entities[i]);
+            var netEntities = new List<NetEntity?>(entities.Count);
+            foreach (var entity in entities)
+                netEntities.Add(GetNetEntity(entity));
+            return netEntities;
         }
 
-        return netEntities;
-    }
-
-    /// <inheritdoc />
-    public NetCoordinates?[] GetNetCoordinatesArray(EntityCoordinates?[] entities)
-    {
-        var netEntities = new NetCoordinates?[entities.Length];
-
-        for (var i = 0; i < entities.Length; i++)
+        /// <inheritdoc />
+        public NetEntity[] GetNetEntityArray(EntityUid[] entities)
         {
-            netEntities[i] = GetNetCoordinates(entities[i]);
+            var netEntities = new NetEntity[entities.Length];
+            for (var i = 0; i < entities.Length; i++)
+                netEntities[i] = GetNetEntity(entities[i]);
+            return netEntities;
         }
 
-        return netEntities;
-    }
+        /// <inheritdoc />
+        public NetEntity?[] GetNetEntityArray(EntityUid?[] entities)
+        {
+            var netEntities = new NetEntity?[entities.Length];
+            for (var i = 0; i < entities.Length; i++)
+                netEntities[i] = GetNetEntity(entities[i]);
+            return netEntities;
+        }
 
-    #endregion
+        /// <inheritdoc />
+        public Dictionary<NetEntity, T> GetNetEntityDictionary<T>(Dictionary<EntityUid, T> entities)
+        {
+            var netEntities = new Dictionary<NetEntity, T>(entities.Count);
+            foreach (var (key, value) in entities)
+                netEntities.Add(GetNetEntity(key), value);
+            return netEntities;
+        }
+
+        /// <inheritdoc />
+        public Dictionary<T, NetEntity> GetNetEntityDictionary<T>(Dictionary<T, EntityUid> entities) where T : notnull
+        {
+            var netEntities = new Dictionary<T, NetEntity>(entities.Count);
+            foreach (var (key, value) in entities)
+                netEntities.Add(key, GetNetEntity(value));
+            return netEntities;
+        }
+
+        /// <inheritdoc />
+        public Dictionary<T, NetEntity?> GetNetEntityDictionary<T>(Dictionary<T, EntityUid?> entities) where T : notnull
+        {
+            var netEntities = new Dictionary<T, NetEntity?>(entities.Count);
+            foreach (var (key, value) in entities)
+                netEntities.Add(key, GetNetEntity(value));
+            return netEntities;
+        }
+
+        /// <inheritdoc />
+        public Dictionary<NetEntity, NetEntity> GetNetEntityDictionary(Dictionary<EntityUid, EntityUid> entities)
+        {
+            var netEntities = new Dictionary<NetEntity, NetEntity>(entities.Count);
+            foreach (var (key, value) in entities)
+                netEntities.Add(GetNetEntity(key), GetNetEntity(value));
+            return netEntities;
+        }
+
+        /// <inheritdoc />
+        public Dictionary<NetEntity, NetEntity?> GetNetEntityDictionary(Dictionary<EntityUid, EntityUid?> entities)
+        {
+            var netEntities = new Dictionary<NetEntity, NetEntity?>(entities.Count);
+            foreach (var (key, value) in entities)
+                netEntities.Add(GetNetEntity(key), GetNetEntity(value));
+            return netEntities;
+        }
+
+        #endregion
+
+        #region GetCoordinates Collections (NetCoordinates -> EntityCoordinates)
+
+        /// <inheritdoc />
+        public HashSet<EntityCoordinates> GetEntitySet(HashSet<NetCoordinates> netEntities)
+        {
+            var entities = new HashSet<EntityCoordinates>(netEntities.Count);
+            foreach (var netCoordinates in netEntities)
+                entities.Add(GetCoordinates(netCoordinates));
+            return entities;
+        }
+
+        /// <inheritdoc />
+        public List<EntityCoordinates> GetEntityList(List<NetCoordinates> netEntities)
+        {
+            var entities = new List<EntityCoordinates>(netEntities.Count);
+            foreach (var netCoordinates in netEntities)
+                entities.Add(GetCoordinates(netCoordinates));
+            return entities;
+        }
+
+        /// <inheritdoc />
+        public List<EntityCoordinates> GetEntityList(ICollection<NetCoordinates> netEntities)
+        {
+            var entities = new List<EntityCoordinates>(netEntities.Count);
+            foreach (var netCoordinates in netEntities)
+                entities.Add(GetCoordinates(netCoordinates));
+            return entities;
+        }
+
+        /// <inheritdoc />
+        public List<EntityCoordinates?> GetEntityList(List<NetCoordinates?> netEntities)
+        {
+            var entities = new List<EntityCoordinates?>(netEntities.Count);
+            foreach (var netCoordinates in netEntities)
+                entities.Add(GetCoordinates(netCoordinates));
+            return entities;
+        }
+
+        /// <inheritdoc />
+        public EntityCoordinates[] GetEntityArray(NetCoordinates[] netEntities)
+        {
+            var entities = new EntityCoordinates[netEntities.Length];
+            for (var i = 0; i < netEntities.Length; i++)
+                entities[i] = GetCoordinates(netEntities[i]);
+            return entities;
+        }
+
+        /// <inheritdoc />
+        public EntityCoordinates?[] GetEntityArray(NetCoordinates?[] netEntities)
+        {
+            var entities = new EntityCoordinates?[netEntities.Length];
+            for (var i = 0; i < netEntities.Length; i++)
+                entities[i] = GetCoordinates(netEntities[i]);
+            return entities;
+        }
+
+        #endregion
+
+        #region GetNetCoordinates Collections (EntityCoordinates -> NetCoordinates)
+
+        /// <inheritdoc />
+        public HashSet<NetCoordinates> GetNetCoordinatesSet(HashSet<EntityCoordinates> entities)
+        {
+            var newSet = new HashSet<NetCoordinates>(entities.Count);
+            foreach (var coordinates in entities)
+                newSet.Add(GetNetCoordinates(coordinates));
+            return newSet;
+        }
+
+        /// <inheritdoc />
+        public List<NetCoordinates> GetNetCoordinatesList(List<EntityCoordinates> entities)
+        {
+            var netEntities = new List<NetCoordinates>(entities.Count);
+            foreach (var netCoordinates in entities)
+                netEntities.Add(GetNetCoordinates(netCoordinates));
+            return netEntities;
+        }
+
+        /// <inheritdoc />
+        public List<NetCoordinates> GetNetCoordinatesList(ICollection<EntityCoordinates> entities)
+        {
+            var netEntities = new List<NetCoordinates>(entities.Count);
+            foreach (var netCoordinates in entities)
+                netEntities.Add(GetNetCoordinates(netCoordinates));
+            return netEntities;
+        }
+
+        /// <inheritdoc />
+        public List<NetCoordinates?> GetNetCoordinatesList(List<EntityCoordinates?> entities)
+        {
+            var netEntities = new List<NetCoordinates?>(entities.Count);
+            foreach (var netCoordinates in entities)
+                netEntities.Add(GetNetCoordinates(netCoordinates));
+            return netEntities;
+        }
+
+        /// <inheritdoc />
+        public NetCoordinates[] GetNetCoordinatesArray(EntityCoordinates[] entities)
+        {
+            var netEntities = new NetCoordinates[entities.Length];
+            for (var i = 0; i < entities.Length; i++)
+                netEntities[i] = GetNetCoordinates(entities[i]);
+            return netEntities;
+        }
+
+        /// <inheritdoc />
+        public NetCoordinates?[] GetNetCoordinatesArray(EntityCoordinates?[] entities)
+        {
+            var netEntities = new NetCoordinates?[entities.Length];
+            for (var i = 0; i < entities.Length; i++)
+                netEntities[i] = GetNetCoordinates(entities[i]);
+            return netEntities;
+        }
+
+        #endregion
+
+        #endregion
+    }
 }

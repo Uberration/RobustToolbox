@@ -1,3 +1,5 @@
+// Filename: Robust.Client/GameObjects/ClientEntityManager.cs
+
 using System;
 using System.Collections.Generic;
 using Prometheus;
@@ -11,14 +13,21 @@ using Robust.Shared.Network.Messages;
 using Robust.Shared.Player;
 using Robust.Shared.Replays;
 using Robust.Shared.Utility;
+using System.Linq;
+
+#nullable enable
 
 namespace Robust.Client.GameObjects
 {
     /// <summary>
-    /// Manager for entities -- controls things like template loading and instantiation
+    /// The client-side implementation of the <see cref="IEntityManager"/>.
+    /// Manages client-specific logic including prediction, game state application, and client-side entities.
     /// </summary>
     public sealed partial class ClientEntityManager : EntityManager, IClientEntityManagerInternal
     {
+
+        #region Dependencies and Internal State
+
         [Dependency] private readonly IPlayerManager _playerManager = default!;
         [Dependency] private readonly IClientNetManager _networkManager = default!;
         [Dependency] private readonly IClientGameTiming _gameTiming = default!;
@@ -26,11 +35,15 @@ namespace Robust.Client.GameObjects
         [Dependency] private readonly IBaseClient _client = default!;
         [Dependency] private readonly IReplayRecordingManager _replayRecording = default!;
 
+        private readonly PriorityQueue<(uint seq, MsgEntity msg)> _networkMessageQueue = new(new MessageTickComparer());
+        private uint _incomingMsgSequence;
+
         internal event Action? AfterStartup;
         internal event Action? AfterShutdown;
 
-        private readonly Queue<EntityUid> _queuedPredictedDeletions = new();
-        private readonly HashSet<EntityUid> _queuedPredictedDeletionsSet = new();
+        #endregion
+
+        #region Lifecycle Overrides
 
         public override void Initialize()
         {
@@ -43,92 +56,134 @@ namespace Robust.Client.GameObjects
         public override void Startup()
         {
             base.Startup();
-
             AfterStartup?.Invoke();
         }
 
         public override void Shutdown()
         {
             base.Shutdown();
-
             AfterShutdown?.Invoke();
         }
 
         public override void FlushEntities()
         {
-            // Server doesn't network deletions on client shutdown so we need to
-            // manually clear these out or risk stale data getting used.
-            PendingNetEntityStates.Clear();
+            // The server doesn't send deletion messages during client shutdown. We must clear
+            // all entities manually to prevent stale data issues on reconnect.
+            // This is especially important for PVS, which has its own entity lists.
+            _stateMan.Reset();
+
             using var _ = _gameTiming.StartStateApplicationArea();
             base.FlushEntities();
         }
 
+        public override void TickUpdate(float frameTime, bool noPredictions, Histogram? histogram)
+        {
+            using (histogram?.WithLabels("EntityNet").NewTimer())
+            {
+                // Process any queued network messages that are due for the last "real" tick
+                // (before prediction starts).
+                while (_networkMessageQueue.Count > 0 && _networkMessageQueue.Peek().msg.SourceTick <= _gameTiming.LastRealTick)
+                {
+                    var (_, msg) = _networkMessageQueue.Take();
+                    DispatchReceivedNetworkMsg(msg);
+                }
+            }
+
+            base.TickUpdate(frameTime, noPredictions, histogram);
+        }
+
+        #endregion
+
+        #region Entity Management and Prediction
+
+        // This is an explicit interface implementation, not an override. It's fine.
         EntityUid IClientEntityManagerInternal.CreateEntity(string? prototypeName, out MetaDataComponent metadata)
         {
             return base.CreateEntity(prototypeName, out metadata);
         }
 
         /// <inheritdoc />
-        public override void DirtyEntity(EntityUid uid, MetaDataComponent? meta = null)
-        {
-            //  Client only dirties during prediction
-            if (_gameTiming.InPrediction)
-                base.DirtyEntity(uid, meta);
-        }
-
         public override void QueueDeleteEntity(EntityUid? uid)
         {
-            if (uid == null || uid == EntityUid.Invalid)
+            if (uid == null)
                 return;
 
             if (IsClientSide(uid.Value))
             {
+                // This is a purely client-side entity (e.g., UI effect). Delete it normally.
                 base.QueueDeleteEntity(uid);
                 return;
             }
 
-            if (ShuttingDown)
+            // A networked entity cannot be truly deleted by the client.
+            // This is likely a predictive action. Instead of deleting, we log an error in case this was not intended.
+            if (_client.RunLevel is ClientRunLevel.Connected or ClientRunLevel.InGame)
+                LogManager.RootSawmill.Error($"Attempted to queue deletion of a networked entity: {ToPrettyString(uid.Value)}. This is not supported. Trace: {Environment.StackTrace}");
+        }
+
+        /// <inheritdoc />
+        public override void PredictedDeleteEntity(Entity<MetaDataComponent?, TransformComponent?> ent)
+        {
+            if (!MetaQuery.Resolve(ent.Owner, ref ent.Comp1) || ent.Comp1.EntityLifeStage >= EntityLifeStage.Terminating)
                 return;
 
-            // Client-side entity deletion is not supported and will cause errors.
-            if (_client.RunLevel == ClientRunLevel.Connected || _client.RunLevel == ClientRunLevel.InGame)
-                LogManager.RootSawmill.Error($"Predicting the queued deletion of a networked entity: {ToPrettyString(uid.Value)}. Trace: {Environment.StackTrace}");
+            // For client-side entities, we can delete them immediately.
+            if (ent.Comp1.NetEntity.IsClientSide())
+            {
+                DeleteEntity(ent.Owner, ent.Comp1, ent.Comp2!); // Comp2 is resolved implicitly by DeleteEntity logic.
+                return;
+            }
+
+            // For networked entities, "predictive deletion" means moving it to null-space.
+            // The entity will be properly deleted when the server confirms it via a game state update.
+            if (TransformQuery.Resolve(ent.Owner, ref ent.Comp2))
+                _xforms.DetachEntity(ent.Owner, ent.Comp2);
+        }
+
+        /// <inheritdoc />
+        public override void PredictedQueueDeleteEntity(Entity<MetaDataComponent?> ent)
+        {
+             if (IsQueuedForDeletion(ent.Owner) || !MetaQuery.Resolve(ent.Owner, ref ent.Comp) || ent.Comp.EntityLifeStage >= EntityLifeStage.Terminating)
+                 return;
+
+            if (ent.Comp.NetEntity.IsClientSide())
+            {
+                base.QueueDeleteEntity(ent.Owner);
+            }
+            else if (TransformQuery.TryComp(ent.Owner, out var xform))
+            {
+                _xforms.DetachEntity(ent.Owner, xform);
+            }
+        }
+
+        [Obsolete("use variant without TransformComponent")]
+        public override void PredictedQueueDeleteEntity(Entity<MetaDataComponent?, TransformComponent?> ent)
+            => PredictedQueueDeleteEntity(new Entity<MetaDataComponent?>(ent.Owner, ent.Comp1));
+
+        #endregion
+
+        #region Dirtying Overrides (Prediction)
+
+        /// <inheritdoc />
+        public override void DirtyEntity(EntityUid uid, MetaDataComponent? meta = null)
+        {
+            // Client only dirties components during prediction.
+            if (_gameTiming.InPrediction)
+                base.DirtyEntity(uid, meta);
         }
 
         /// <inheritdoc />
         public override void Dirty(EntityUid uid, IComponent component, MetaDataComponent? meta = null)
         {
-            Dirty(new Entity<IComponent>(uid, component), meta);
+            if (_gameTiming.InPrediction)
+                base.Dirty(uid, component, meta);
         }
 
         /// <inheritdoc />
         public override void Dirty<T>(Entity<T> ent, MetaDataComponent? meta = null)
         {
-            // Client only dirties during prediction
             if (_gameTiming.InPrediction)
                 base.Dirty(ent, meta);
-        }
-
-        public override void DirtyField<T>(EntityUid uid, T comp, string fieldName, MetaDataComponent? metadata = null)
-        {
-            // TODO Prediction
-            // does the client actually need to dirty the field?
-            // I.e., can't it just dirty the whole component to trigger a reset?
-
-            // Client only dirties during prediction
-            if (_gameTiming.InPrediction)
-                base.DirtyField(uid, comp, fieldName, metadata);
-        }
-
-        public override void DirtyFields<T>(EntityUid uid, T comp, MetaDataComponent? meta, params string[] fields)
-        {
-            // TODO Prediction
-            // does the client actually need to dirty the field?
-            // I.e., can't it just dirty the whole component to trigger a reset?
-
-            // Client only dirties during prediction
-            if (_gameTiming.InPrediction)
-                base.DirtyFields(uid, comp, meta, fields);
         }
 
         /// <inheritdoc />
@@ -152,27 +207,48 @@ namespace Robust.Client.GameObjects
                 base.Dirty(ent, meta);
         }
 
+        #endregion
+
+        #region Event Broadcasting
+
         public override void RaisePredictiveEvent<T>(T msg)
         {
             var session = _playerManager.LocalSession;
-            DebugTools.AssertNotNull(session);
 
+            // A predictive event can only be raised if there is a local player session.
+            // If we're not in a game (e.g., in the main menu), this will be null.
+            if (session == null)
+            {
+                LogManager.RootSawmill.Warning($"Attempted to raise a predictive event ({typeof(T).Name}) with no active player session.");
+                return;
+            }
+
+            // Inform the game state manager that we are sending a message, and get its sequence number for prediction.
             var sequence = _stateMan.SystemMessageDispatched(msg);
-            EntityNetManager?.SendSystemNetworkMessage(msg, sequence);
 
+            // Call the method directly on this instance to resolve the ambiguity between
+            // IEntityNetworkManager.SendSystemNetworkMessage(msg, bool) and
+            // ClientEntityManager.SendSystemNetworkMessage(msg, uint).
+            SendSystemNetworkMessage(msg, sequence);
+
+            // If prediction is disabled, we don't apply the event locally. We wait for the server's authoritative state.
             if (!_stateMan.IsPredictionEnabled && _client.RunLevel != ClientRunLevel.SinglePlayerGame)
                 return;
 
-            DebugTools.Assert(_gameTiming.InPrediction && _gameTiming.IsFirstTimePredicted || _client.RunLevel == ClientRunLevel.SinglePlayerGame);
+            // Ensure we are in a valid prediction context before applying the event.
+            DebugTools.Assert(
+                (_gameTiming.InPrediction && _gameTiming.IsFirstTimePredicted) || _client.RunLevel == ClientRunLevel.SinglePlayerGame,
+                "Predictive event raised outside of a valid prediction context.");
 
-            var eventArgs = new EntitySessionEventArgs(session!);
+            // Raise the event locally for immediate feedback (this is the "prediction" part).
+            var eventArgs = new EntitySessionEventArgs(session);
             EventBus.RaiseEvent(EventSource.Local, msg);
             EventBus.RaiseEvent(EventSource.Local, new EntitySessionMessage<T>(eventArgs, msg));
         }
-
         /// <inheritdoc />
         public override void RaiseSharedEvent<T>(T message, EntityUid? user = null)
         {
+            // Only raise shared events locally if we are the user and it's the first prediction tick.
             if (user == null || user != _playerManager.LocalEntity || !_gameTiming.IsFirstTimePredicted)
                 return;
 
@@ -182,202 +258,113 @@ namespace Robust.Client.GameObjects
         /// <inheritdoc />
         public override void RaiseSharedEvent<T>(T message, ICommonSession? user = null)
         {
+            // Only raise shared events locally if we are the user and it's the first prediction tick.
             if (user == null || user != _playerManager.LocalSession || !_gameTiming.IsFirstTimePredicted)
                 return;
 
             EventBus.RaiseEvent(EventSource.Local, ref message);
         }
 
-        #region IEntityNetworkManager impl
+        #endregion
+
+        #region Networking Implementation
 
         public override IEntityNetworkManager EntityNetManager => this;
 
-        /// <inheritdoc />
         public event EventHandler<object>? ReceivedSystemMessage;
 
-        private readonly PriorityQueue<(uint seq, MsgEntity msg)> _queue = new(new MessageTickComparer());
-        private uint _incomingMsgSequence = 0;
-
-        /// <inheritdoc />
         public void SetupNetworking()
         {
             _networkManager.RegisterNetMessage<MsgEntity>(HandleEntityNetworkMessage);
         }
 
-        public override void TickUpdate(float frameTime, bool noPredictions, Histogram? histogram)
-        {
-            using (histogram?.WithLabels("EntityNet").NewTimer())
-            {
-                while (_queue.Count != 0 && _queue.Peek().msg.SourceTick <= _gameTiming.LastRealTick)
-                {
-                    var (_, msg) = _queue.Take();
-                    // Logger.DebugS("net.ent", "Dispatching: {0}: {1}", seq, msg);
-                    DispatchReceivedNetworkMsg(msg);
-                }
-            }
-
-            using (histogram?.WithLabels("PredictedQueueDel").NewTimer())
-            {
-                while (_queuedPredictedDeletions.TryDequeue(out var uid))
-                {
-                    if (!MetaQuery.TryGetComponentInternal(uid, out var meta))
-                        continue;
-
-                    if (meta.EntityLifeStage >= EntityLifeStage.Terminating)
-                        continue;
-
-                    var xform = TransformQuery.GetComponentInternal(uid);
-                    if (meta.NetEntity.IsClientSide())
-                    {
-                        DeleteEntity(uid, meta, xform);
-                    }
-                    else
-                    {
-                        _xforms.DetachEntity(uid, xform, meta, null);
-                        // base call bypasses IGameTiming.InPrediction check
-                        // This is pretty janky and there should be a way for the client to dirty an entity outside of prediction
-                        // TODO PREDICTION
-                        base.Dirty(uid, xform, meta);
-                    }
-                }
-
-                _queuedPredictedDeletionsSet.Clear();
-            }
-
-            base.TickUpdate(frameTime, noPredictions, histogram);
-        }
-
-        /// <inheritdoc />
         public void SendSystemNetworkMessage(EntityEventArgs message, bool recordReplay = true)
         {
-            SendSystemNetworkMessage(message, default(uint));
+            // The '0u' suffix explicitly tells the compiler this is a uint, resolving the ambiguity.
+            SendSystemNetworkMessage(message, 0u);
         }
 
         public void SendSystemNetworkMessage(EntityEventArgs message, uint sequence)
         {
-            var msg = new MsgEntity();
-            msg.Type = EntityMessageType.SystemMessage;
-            msg.SystemMessage = message;
-            msg.SourceTick = _gameTiming.CurTick;
-            msg.Sequence = sequence;
+            var msg = new MsgEntity
+            {
+                Type = EntityMessageType.SystemMessage,
+                SystemMessage = message,
+                SourceTick = _gameTiming.CurTick,
+                Sequence = sequence
+            };
 
             _networkManager.ClientSendMessage(msg);
         }
 
-        /// <inheritdoc />
         public void SendSystemNetworkMessage(EntityEventArgs message, INetChannel? channel)
         {
+            // The client can only send messages to the server, not to arbitrary channels.
             throw new NotSupportedException();
         }
 
         private void HandleEntityNetworkMessage(MsgEntity message)
         {
+            // If the message is old, dispatch it immediately. Otherwise, queue it for its target tick.
             if (message.SourceTick <= _gameTiming.LastRealTick)
             {
                 DispatchReceivedNetworkMsg(message);
                 return;
             }
 
-            // MsgEntity is sent with ReliableOrdered so Lidgren guarantees ordering of incoming messages.
-            // We still need to store a sequence input number to ensure ordering remains consistent in
-            // the priority queue.
-            _queue.Add((++_incomingMsgSequence, message));
+            _networkMessageQueue.Add((++_incomingMsgSequence, message));
         }
 
         private void DispatchReceivedNetworkMsg(MsgEntity message)
         {
-            switch (message.Type)
+            if (message.Type == EntityMessageType.SystemMessage && message.SystemMessage != null)
             {
-                case EntityMessageType.SystemMessage:
-
-                    // TODO REPLAYS handle late messages.
-                    // If a message was received late, it will be recorded late here.
-                    // Maybe process the replay to prevent late messages when playing back?
-                    _replayRecording.RecordReplayMessage(message.SystemMessage);
-
-                    DispatchReceivedNetworkMsg(message.SystemMessage);
-                    return;
+                _replayRecording.RecordReplayMessage(message.SystemMessage);
+                DispatchReceivedNetworkMsg(message.SystemMessage);
             }
         }
 
         public void DispatchReceivedNetworkMsg(EntityEventArgs msg)
         {
-            var sessionType = typeof(EntitySessionMessage<>).MakeGenericType(msg.GetType());
-            var sessionMsg = Activator.CreateInstance(sessionType, new EntitySessionEventArgs(_playerManager.LocalSession!), msg)!;
+            if (_playerManager.LocalSession == null) return;
+
+               var session = _playerManager.LocalSession!;
+
+            // Raise the base, non-session-specific event for general listeners.
             ReceivedSystemMessage?.Invoke(this, msg);
-            ReceivedSystemMessage?.Invoke(this, sessionMsg);
+
+            // Now, create and raise the strongly-typed session message through the EventBus using reflection.
+            var msgType = msg.GetType();
+            var sessionType = typeof(EntitySessionMessage<>).MakeGenericType(msgType);
+            var sessionMsg = Activator.CreateInstance(sessionType, new EntitySessionEventArgs(session), msg)!;
+
+            // We must be extremely specific to resolve the ambiguity. We want the generic RaiseEvent method
+            // that takes two arguments, where the second argument is NOT a by-ref parameter.
+            var method = typeof(IBroadcastEventBus).GetMethods()
+                .Single(m =>
+                    m.Name == nameof(IBroadcastEventBus.RaiseEvent) &&
+                    m.IsGenericMethodDefinition &&
+                    m.GetParameters().Length == 2 &&
+                    !m.GetParameters()[1].ParameterType.IsByRef);
+
+            var generic = method.MakeGenericMethod(sessionType);
+            generic.Invoke(EventBus, new object[] { EventSource.Network, sessionMsg });
         }
 
         private sealed class MessageTickComparer : IComparer<(uint seq, MsgEntity msg)>
         {
             public int Compare((uint seq, MsgEntity msg) x, (uint seq, MsgEntity msg) y)
             {
-                var cmp = y.msg.SourceTick.CompareTo(x.msg.SourceTick);
+                // Invert tick comparison to make the PriorityQueue a Min-Heap.
+                var cmp = x.msg.SourceTick.CompareTo(y.msg.SourceTick);
                 if (cmp != 0)
-                {
                     return cmp;
-                }
 
-                return y.seq.CompareTo(x.seq);
+                // Use sequence number as a tie-breaker.
+                return x.seq.CompareTo(y.seq);
             }
         }
+
         #endregion
-
-        /// <inheritdoc />
-        public override void PredictedDeleteEntity(Entity<MetaDataComponent?, TransformComponent?> ent)
-        {
-            if (!MetaQuery.Resolve(ent.Owner, ref ent.Comp1)
-                || ent.Comp1.EntityLifeStage >= EntityLifeStage.Terminating
-                || !TransformQuery.Resolve(ent.Owner, ref ent.Comp2))
-            {
-                return;
-            }
-
-            // So there's 3 scenarios:
-            // 1. Networked entity we just move to nullspace and rely on state handling.
-            // 2. Clientside predicted entity we delete and rely on state handling.
-            // 3. Clientside only entity that actually needs deleting here.
-
-            if (ent.Comp1.NetEntity.IsClientSide())
-            {
-                DeleteEntity(ent, ent.Comp1, ent.Comp2);
-            }
-            else
-            {
-                _xforms.DetachEntity(ent, ent.Comp2);
-            }
-        }
-
-        public override bool IsQueuedForDeletion(EntityUid uid)
-            => QueuedDeletionsSet.Contains(uid) || _queuedPredictedDeletions.Contains(uid);
-
-        /// <inheritdoc />
-        public override void PredictedQueueDeleteEntity(Entity<MetaDataComponent?> ent)
-        {
-            // Some UIs get disposed after entity-manager has shut down and already deleted all entities.
-            if (!Started)
-                return;
-
-            if (IsQueuedForDeletion(ent.Owner))
-                return;
-
-            if (!MetaQuery.Resolve(ent.Owner, ref ent.Comp, false))
-                return;
-
-            if (ent.Comp.NetEntity.IsClientSide())
-            {
-                // client-side QueueDeleteEntity re-fetches MetadataComp and checks IsClientSide().
-                // base call to skip that.
-                // TODO create override that takes in metadata comp
-                base.QueueDeleteEntity(ent);
-            }
-            else
-            {
-                if (!_queuedPredictedDeletionsSet.Add(ent.Owner))
-                    return;
-
-                _queuedPredictedDeletions.Enqueue(ent.Owner);
-            }
-        }
     }
 }

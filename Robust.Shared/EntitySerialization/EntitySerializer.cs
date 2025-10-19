@@ -3,7 +3,8 @@ using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Linq;
-using Robust.Shared.Configuration;
+using System.Runtime.Serialization;
+using JetBrains.Annotations;
 using Robust.Shared.EntitySerialization.Components;
 using Robust.Shared.EntitySerialization.Systems;
 using Robust.Shared.GameObjects;
@@ -23,1105 +24,897 @@ using Robust.Shared.Serialization.TypeSerializers.Interfaces;
 using Robust.Shared.Timing;
 using Robust.Shared.Utility;
 
+#nullable enable
+
 namespace Robust.Shared.EntitySerialization;
 
 /// <summary>
-/// This class provides methods for serializing entities into yaml. It provides some more control over
+/// This class provides methods for deserializing entities from yaml. It provides some more control over
 /// serialization than the methods provided by <see cref="MapLoaderSystem"/>.
 /// </summary>
-/// <remarks>
-/// There are several methods (e.g., <see cref="SerializeEntityRecursive"/> that serialize entities into a
-/// per-entity <see cref="MappingDataNode"/> stored in the <see cref="EntityData"/> dictionary, which is indexed by the
-/// entity's assigned yaml id (see <see cref="GetYamlUid"/>. The generated data can then be written to a larger yaml
-/// document using the various "Write" methods. (e.g., <see cref="WriteEntitySection"/>). After a one has finished using
-/// the generated data, the serializer needs to be reset (<see cref="Reset"/>) using it again to serialize other entities.
-/// </remarks>
-public sealed class EntitySerializer : ISerializationContext,
+public sealed class EntityDeserializer :
+    ISerializationContext,
     ITypeSerializer<EntityUid, ValueDataNode>,
-    ITypeSerializer<NetEntity, ValueDataNode>,
-    ITypeSerializer<MapId, ValueDataNode>
+    ITypeSerializer<NetEntity, ValueDataNode>
 {
-    public const int MapFormatVersion = 7;
-    // v6->v7: PR #5572 - Added more metadata, List maps/grids/orphans, include some life-stage information
-    // v5->v6: PR #4307 - Converted Tile.TypeId from ushort to int
-    // v4->v5: PR #3992 - Removed name & author fields
-    // v3->v4: PR #3913 - Grouped entities by prototype
-    // v2->v3: PR #3468
+    // See the comments around EntitySerializer's version const for information about the different versions.
+    public const int OldestSupportedVersion = 3;
+    public const int NewestSupportedVersion = EntitySerializer.MapFormatVersion;
 
     public SerializationManager.SerializerProvider SerializerProvider { get; } = new();
 
     [Dependency] public readonly EntityManager EntMan = default!;
     [Dependency] public readonly IGameTiming Timing = default!;
+    [Dependency] private readonly ISerializationManager _seriMan = default!;
     [Dependency] private readonly IComponentFactory _factory = default!;
-    [Dependency] private readonly ISerializationManager _serialization = default!;
-    [Dependency] private readonly ITileDefinitionManager _tileDef = default!;
-    [Dependency] private readonly IConfigurationManager _conf = default!;
-    [Dependency] private readonly ILogManager _logMan = default!;
+    [Dependency] private readonly IPrototypeManager _proto = default!;
     [Dependency] private readonly SharedMapSystem _map = default!;
+    [Dependency] private readonly ILogManager _logMan = default!;
+    [Dependency] private readonly IDependencyCollection _deps = default!;
 
     private readonly ISawmill _log;
-    public readonly Dictionary<EntityUid, int> YamlUidMap = new();
-    public readonly HashSet<int> YamlIds = new();
+    private readonly Stopwatch _stopwatch = new();
 
-    public string? CurrentComponent { get; private set; }
-    public Entity<MetaDataComponent>? CurrentEntity { get; private set; }
-    public int CurrentEntityYamlUid { get; private set; }
+    public readonly DeserializationOptions Options;
+    public readonly MappingDataNode Data;
+    public readonly Dictionary<EntityUid, EntData> Entities = new();
+    public readonly Dictionary<int, EntData> YamlEntities = new();
+    public readonly Dictionary<string, List<EntData>> Prototypes = new();
 
-    /// <summary>
-    /// Tile ID -> yaml tile ID mapping.
-    /// </summary>
-    private readonly Dictionary<int, int> _tileMap = new();
-    private readonly HashSet<int> _yamlTileIds = new();
+    public record struct EntData(
+        int YamlId,
+        MappingDataNode Node,
+        Dictionary<string, MappingDataNode>? Components,
+        HashSet<string>? MissingComponents,
+        bool PostInit,
+        bool Paused,
+        bool ToDelete);
 
-    /// <inheritdoc/>
+    public readonly LoadResult Result = new();
+    public readonly Dictionary<int, string> TileMap = new();
+    public readonly Dictionary<int, EntityUid> UidMap = new();
+    public readonly List<int> MapYamlIds = new();
+    public readonly List<int> GridYamlIds = new();
+    public readonly List<int> OrphanYamlIds = new();
+    public readonly List<int> NullspaceYamlIds = new();
+    public readonly Dictionary<string, string> RenamedPrototypes;
+    public readonly HashSet<string> DeletedPrototypes;
+
+    public readonly HashSet<EntityUid> PostMapInit = new();
+    public readonly HashSet<EntityUid> Paused = new();
+    public readonly HashSet<EntityUid> ToDelete = new();
+    public readonly List<EntityUid> SortedEntities = new();
+
+    private readonly Dictionary<string, MappingDataNode> _components = new();
+    public EntData? CurrentReadingEntity;
+    public string? CurrentComponent;
+    private readonly EntityQuery<MapComponent> _mapQuery;
+    private readonly EntityQuery<MapGridComponent> _gridQuery;
+    private readonly EntityQuery<TransformComponent> _xformQuery;
+    private readonly EntityQuery<MetaDataComponent> _metaQuery;
+
+    public EntityDeserializer(
+        IDependencyCollection deps,
+        MappingDataNode data,
+        DeserializationOptions options,
+        Dictionary<string, string>? renamedPrototypes = null,
+        HashSet<string>? deletedPrototypes = null)
+    {
+        deps.InjectDependencies(this);
+        _log = _logMan.GetSawmill("entity_deserializer");
+        _log.Level = LogLevel.Info;
+        SerializerProvider.RegisterSerializer(this);
+        Data = data;
+        Options = options;
+        RenamedPrototypes = renamedPrototypes ?? new();
+        DeletedPrototypes = deletedPrototypes ?? new();
+
+        _mapQuery = EntMan.GetEntityQuery<MapComponent>();
+        _gridQuery = EntMan.GetEntityQuery<MapGridComponent>();
+        _xformQuery = EntMan.GetEntityQuery<TransformComponent>();
+        _metaQuery = EntMan.GetEntityQuery<MetaDataComponent>();
+    }
+
     public bool WritingReadingPrototypes { get; private set; }
 
-    /// <summary>
-    /// If set, the serializer will refuse to serialize the given entity and will orphan any entity that is parented to
-    /// it. This is useful for serializing things like a grid (or multiple grids & entities) that are parented to a map
-    /// without actually serializing the map itself.
-    /// </summary>
-    public EntityUid Truncate { get; private set; }
-
-    /// <summary>
-    /// List of all entities that have previously been ignored via <see cref="Truncate"/>.
-    /// </summary>
-    /// <remarks>
-    /// This is tracked in case somebody does something weird, like trying to save a grid w/o its map, and then later on
-    /// including the map in the file. AFAIK, that should work in principle, though it would lead to a weird file where
-    /// the grid is orphaned and not on the map where it should be.
-    /// </remarks>
-    public readonly HashSet<EntityUid> Truncated = new();
-
-    public readonly SerializationOptions Options;
-
-    /// <summary>
-    /// Cached prototype data. This is used to avoid writing redundant data that is already specified in an entity's
-    /// prototype.
-    /// </summary>
-    public readonly Dictionary<string, Dictionary<string, MappingDataNode>> PrototypeCache = new();
-
-    /// <summary>
-    /// The serialized entity data.
-    /// </summary>
-    public readonly Dictionary<int, (EntityUid Uid, MappingDataNode Node)> EntityData = new();
-
-    /// <summary>
-    /// <see cref="EntityData"/> indices grouped by their entity prototype ids.
-    /// </summary>
-    public readonly Dictionary<string, List<int>> Prototypes = new();
-
-    /// <summary>
-    /// Set of entities that have encountered issues during serialization and are now being ignored.
-    /// </summary>
-    public HashSet<EntityUid> ErroringEntities = new();
-
-    /// <summary>
-    /// Yaml ids of all serialized map entities.
-    /// </summary>
-    public readonly List<int> Maps = new();
-
-    /// <summary>
-    /// Yaml ids of all serialized null-space entities.
-    /// This only includes entities that were initially in null-space, it does not include entities that were
-    /// serialized without their parents. Those are in <see cref="Orphans"/>.
-    /// </summary>
-    public readonly List<int> Nullspace = new();
-
-    /// <summary>
-    /// Yaml ids of all serialized grid entities.
-    /// </summary>
-    public readonly List<int> Grids = new();
-
-    /// <summary>
-    /// Yaml ids of all serialized entities in the file whose parents were not serialized. This does not include
-    /// entities that did not have a parent (e.g., maps or null-space entities). I.e., these are the entities that
-    /// need to be attached to a new parent when loading the file, unless you want to load them into null-space.
-    /// </summary>
-    public readonly List<int> Orphans = new();
-
-    private readonly string _metaName;
-    private readonly string _xformName;
-    private readonly MappingDataNode _emptyMetaNode;
-    private readonly MappingDataNode _emptyXformNode;
-    private int _nextYamlUid = 1;
-    private int _nextYamlTileId;
-
-    private readonly List<EntityUid> _autoInclude = new();
-    private readonly EntityQuery<YamlUidComponent> _yamlQuery;
-    private readonly EntityQuery<MapGridComponent> _gridQuery;
-    private readonly EntityQuery<MapComponent> _mapQuery;
-    private readonly EntityQuery<MetaDataComponent> _metaQuery;
-    private readonly EntityQuery<TransformComponent> _xformQuery;
-
-    /// <summary>
-    /// C# event for checking whether an entity is serializable. Can be used by content to prevent specific entities
-    /// from getting serialized.
-    /// </summary>
-    public event IsSerializableDelegate? OnIsSerializeable;
-    public delegate void IsSerializableDelegate(Entity<MetaDataComponent> ent, ref bool serializable);
-
-    public EntitySerializer(IDependencyCollection dependency, SerializationOptions options)
+    public bool TryProcessData()
     {
-        dependency.InjectDependencies(this);
+        ReadMetadata();
 
-        _log = _logMan.GetSawmill("entity_serializer");
-        SerializerProvider.RegisterSerializer(this);
+        if (Result.Version < OldestSupportedVersion)
+        {
+            _log.Error($"Cannot handle this map file version, found v{Result.Version} and require at least v{OldestSupportedVersion}");
+            return false;
+        }
 
-        _metaName = _factory.GetComponentName<MetaDataComponent>();
-        _xformName = _factory.GetComponentName<TransformComponent>();
-        _emptyMetaNode = _serialization.WriteValueAs<MappingDataNode>(typeof(MetaDataComponent), new MetaDataComponent(), alwaysWrite: true, context: this);
+        if (Result.Version > NewestSupportedVersion)
+        {
+            _log.Error($"Cannot handle this map file version, found v{Result.Version} but require at most v{NewestSupportedVersion}");
+            return false;
+        }
 
-        CurrentComponent = _xformName;
-        _emptyXformNode = _serialization.WriteValueAs<MappingDataNode>(typeof(TransformComponent), new TransformComponent(), alwaysWrite: true, context: this);
-        CurrentComponent = null;
-
-        _yamlQuery = EntMan.GetEntityQuery<YamlUidComponent>();
-        _gridQuery = EntMan.GetEntityQuery<MapGridComponent>();
-        _mapQuery = EntMan.GetEntityQuery<MapComponent>();
-        _metaQuery = EntMan.GetEntityQuery<MetaDataComponent>();
-        _xformQuery = EntMan.GetEntityQuery<TransformComponent>();
-        Options = options;
-    }
-
-    public bool IsSerializable(Entity<MetaDataComponent?> ent)
-    {
-        if (ent.Comp == null && !EntMan.TryGetComponent(ent.Owner, out ent.Comp))
+        if (!ValidatePrototypes())
             return false;
 
-        if (ent.Comp.EntityPrototype?.MapSavable == false)
-            return false;
-
-        bool serializable = true;
-        OnIsSerializeable?.Invoke(ent!, ref serializable);
-        return serializable;
+        ReadEntities();
+        ReadTileMap();
+        ReadMapsAndGrids();
+        return true;
     }
 
-    #region Serialize API
-
-    /// <summary>
-    /// Serialize a single entity. This does not automatically include
-    /// children, though depending on the setting of <see cref="SerializationOptions.MissingEntityBehaviour"/> it may
-    /// auto-include additional entities aside from the one provided.
-    /// </summary>
-    public void SerializeEntity(EntityUid uid)
+    public void CreateEntities()
     {
-        if (!IsSerializable(uid))
-            throw new Exception($"{EntMan.ToPrettyString(uid)} is not serializable");
+        AllocateEntities();
+        LoadEntities();
+        GetRootEntities();
+        RemoveEmptyChunks();
+        StoreGridTileMap();
 
-        DebugTools.AssertNull(CurrentEntity);
-        ReserveYamlId(uid);
-        SerializeEntityInternal(uid);
-        DebugTools.AssertNull(CurrentEntity);
-        if (_autoInclude.Count != 0)
-            ProcessAutoInclude();
+        if (Options.AssignMapids)
+            AssignMapIds();
+
+        CheckCategory();
     }
 
-    /// <summary>
-    /// Serialize a set of entities. This does not automatically include children or parents, though depending on the
-    /// setting of <see cref="SerializationOptions.MissingEntityBehaviour"/> it may auto-include additional entities
-    /// aside from the one provided.
-    /// </summary>
-    public void SerializeEntities(HashSet<EntityUid> entities)
+    public void StartEntities()
     {
-        foreach (var uid in entities)
-        {
-            if (!IsSerializable(uid))
-                throw new Exception($"{EntMan.ToPrettyString(uid)} is not serializable");
-        }
-
-        ReserveYamlIds(entities);
-        SerializeEntitiesInternal(entities);
+        AdoptGrids();
+        ValidateMapIds();
+        BuildEntityHierarchy();
+        StartEntitiesInternal();
+        SetMapInitLifestage();
+        SetPaused();
+        GetRootNodes();
+        PauseMaps();
+        InitializeMaps();
+        ProcessDeletions();
     }
 
-    /// <summary>
-    /// Serializes an entity and all of its serializable children. Note that this will not automatically serialize the
-    /// entity's parents.
-    /// </summary>
-    public void SerializeEntityRecursive(EntityUid root)
+    private void ReadMetadata()
     {
-        if (!IsSerializable(root))
-            throw new Exception($"{EntMan.ToPrettyString(root)} is not serializable");
+        var meta = Data.Get<MappingDataNode>("meta");
+        Result.Version = meta.Get<ValueDataNode>("format").AsInt();
 
-        Truncate = _xformQuery.GetComponent(root).ParentUid;
-        Truncated.Add(Truncate);
-        InitializeTileMap(root);
-        HashSet<EntityUid> entities = new();
-        RecursivelyIncludeChildren(root, entities);
-        ReserveYamlIds(entities);
-        SerializeEntitiesInternal(entities);
-        Truncate = EntityUid.Invalid;
+        if (meta.TryGet<ValueDataNode>("engineVersion", out var engVer))
+            Result.EngineVersion = engVer.Value;
+
+        if (meta.TryGet<ValueDataNode>("forkId", out var forkId))
+            Result.ForkId = forkId.Value;
+
+        if (meta.TryGet<ValueDataNode>("forkVersion", out var forkVer))
+            Result.ForkVersion = forkVer.Value;
+
+        if (meta.TryGet<ValueDataNode>("time", out var timeNode) && DateTime.TryParse(timeNode.Value, out var time))
+            Result.Time = time;
+
+        if (meta.TryGet<ValueDataNode>("category", out var catNode) && Enum.TryParse<FileCategory>(catNode.Value, out var res))
+            Result.Category = res;
     }
 
-    /// <summary>
-    /// Serializes several entities and all of their children. Note that this will not automatically serialize the
-    /// entity's parents.
-    /// </summary>
-    public void SerializeEntityRecursive(HashSet<EntityUid> roots)
+    private bool ValidatePrototypes()
     {
-        if (roots.Count == 0)
-            return;
+        _stopwatch.Restart();
+        var fail = false;
+        var key = Result.Version >= 4 ? "proto" : "type";
+        var entities = Data.Get<SequenceDataNode>("entities");
 
-        InitializeTileMap(roots.First());
-
-        HashSet<EntityUid> allEntities = new();
-        List<(EntityUid Root, HashSet<EntityUid> Children)> entities = new();
-
-        foreach(var root in roots)
+        foreach (var metaDef in entities.Cast<MappingDataNode>())
         {
-            if (!IsSerializable(root))
-                throw new Exception($"{EntMan.ToPrettyString(root)} is not serializable");
-
-            var ents = new HashSet<EntityUid>();
-            RecursivelyIncludeChildren(root, ents);
-            entities.Add((root, ents));
-            allEntities.UnionWith(ents);
-        }
-
-        ReserveYamlIds(allEntities);
-
-        foreach (var (root, children) in entities)
-        {
-            Truncate = _xformQuery.GetComponent(root).ParentUid;
-            Truncated.Add(Truncate);
-            SerializeEntitiesInternal(children);
-            Truncate = EntityUid.Invalid;
-        }
-    }
-
-    #endregion
-
-    /// <summary>
-    /// Initialize the <see cref="_tileMap"/> that is used to serialize grid chunks using
-    /// <see cref="MapChunkSerializer"/>. This initialization just involves checking to see if any of the entities being
-    /// serialized were previously deserialized. If they were, it will re-use the old tile map. This is not actually required,
-    /// and is just meant to prevent large map file diffs when the internal tile ids change. I.e., you can serialize entities
-    /// without initializing the tile map.
-    /// </summary>
-    private void InitializeTileMap(EntityUid root)
-    {
-        if (!FindSavedTileMap(root, out var savedMap))
-            return;
-
-        // Note: some old maps were saved with duplicate id strings.
-        // I.e, multiple integers that correspond to the same prototype id.
-        // Hence the TryAdd()
-        //
-        // Though now we also need to use TryAdd in case InitializeTileMap() is called multiple times.
-        // E.g., if different grids get added separately to a single save file, in which case the
-        // tile map may already be partially populated.
-        foreach (var (origId, prototypeId) in savedMap)
-        {
-            if (_tileDef.TryGetDefinition(prototypeId, out var definition))
-            {
-                _tileMap.TryAdd(definition.TileId, origId);
-                _yamlTileIds.Add(origId); // Make sure we record the IDs we're using so when we need to reserve new ones we can
-            }
-        }
-    }
-
-    private bool FindSavedTileMap(EntityUid root, [NotNullWhen(true)] out Dictionary<int, string>? map)
-    {
-        // Try and fetch the mapping directly
-        if (EntMan.TryGetComponent(root, out MapSaveTileMapComponent? comp))
-        {
-            map = comp.TileMap;
-            return true;
-        }
-
-        // iterate over all of its children and grab the first grid with a mapping
-        var xform = _xformQuery.GetComponent(root);
-        foreach (var child in xform._children)
-        {
-            if (!EntMan.TryGetComponent(child, out MapSaveTileMapComponent? cComp))
+            if (!metaDef.TryGet<ValueDataNode>(key, out var typeNode))
                 continue;
-            map = cComp.TileMap;
-            return true;
+
+            var type = typeNode.Value;
+            if (string.IsNullOrWhiteSpace(type))
+                continue;
+
+            if (RenamedPrototypes.TryGetValue(type, out var newType))
+                type = newType;
+
+            if (DeletedPrototypes.Contains(type))
+            {
+                _log.Warning("Map contains an obsolete/removed prototype: {0}. This may cause unexpected errors.", type);
+                continue;
+            }
+
+            if (_proto.HasIndex<EntityPrototype>(type))
+                continue;
+
+            _log.Error("Missing prototype for map: {0}", type);
+            fail = true;
         }
 
-        map = null;
+        _log.Debug($"Verified entities in {_stopwatch.Elapsed}");
+
+        if (!fail) return true;
+
+        _log.Error("Found missing prototypes in map file. Missing prototypes have been dumped to logs.");
         return false;
     }
 
-    #region AutoInclude
-
-    private void ProcessAutoInclude()
+    private void ReadEntities()
     {
-        DebugTools.AssertEqual(_autoInclude.ToHashSet().Count, _autoInclude.Count);
-
-        var ents = new HashSet<EntityUid>();
-
-        switch (Options.MissingEntityBehaviour)
+        if (Result.Version == 3)
         {
-            case MissingEntityBehaviour.PartialInclude:
-                // Include the entity and any of its direct parents
-                foreach (var uid in _autoInclude)
-                {
-                    RecursivelyIncludeParents(uid, ents);
-                }
-                break;
-            case MissingEntityBehaviour.IncludeNullspace:
-            case MissingEntityBehaviour.AutoInclude:
-                // Find the root transform of all the included entities
-                var roots = new HashSet<EntityUid>();
-                foreach (var uid in _autoInclude)
-                {
-                    GetRootNode(uid, roots);
-                }
-
-                // Recursively include all children of these root nodes.
-                foreach (var root in roots)
-                {
-                    RecursivelyIncludeChildren(root, ents);
-                }
-                break;
-
-            default:
-                throw new ArgumentOutOfRangeException();
-        }
-
-        _autoInclude.Clear();
-        SerializeEntitiesInternal(ents);
-    }
-
-    private void RecursivelyIncludeChildren(EntityUid uid, HashSet<EntityUid> ents)
-    {
-        if (!IsSerializable(uid))
+            ReadEntitiesV3();
             return;
-
-        ents.Add(uid);
-        var xform = _xformQuery.GetComponent(uid);
-        foreach (var child in xform._children)
-        {
-            RecursivelyIncludeChildren(child, ents);
-        }
-    }
-
-    private void GetRootNode(EntityUid uid, HashSet<EntityUid> ents)
-    {
-        if (!IsSerializable(uid))
-            throw new NotSupportedException($"Attempted to auto-include an unserializable entity: {EntMan.ToPrettyString(uid)}");
-
-        var xform = _xformQuery.GetComponent(uid);
-        while (xform.ParentUid.IsValid() && xform.ParentUid != Truncate)
-        {
-            uid = xform.ParentUid;
-            xform = _xformQuery.GetComponent(uid);
-
-            if (!IsSerializable(uid))
-                throw new NotSupportedException($"Encountered an un-serializable parent entity: {EntMan.ToPrettyString(uid)}");
         }
 
-        ents.Add(uid);
-    }
-
-    private void RecursivelyIncludeParents(EntityUid uid, HashSet<EntityUid> ents)
-    {
-        while (uid.IsValid() && uid != Truncate)
+        if (Result.Version < 7)
         {
-            if (!ents.Add(uid))
-                break;
-
-            if (!IsSerializable(uid))
-                throw new NotSupportedException($"Encountered an un-serializable parent entity: {EntMan.ToPrettyString(uid)}");
-
-            uid = _xformQuery.GetComponent(uid).ParentUid;
-        }
-    }
-
-    #endregion
-
-    private void SerializeEntitiesInternal(HashSet<EntityUid> entities)
-    {
-        foreach (var uid in entities)
-        {
-            DebugTools.AssertNull(CurrentEntity);
-            SerializeEntityInternal(uid);
-        }
-
-        DebugTools.AssertNull(CurrentEntity);
-        if (_autoInclude.Count != 0)
-            ProcessAutoInclude();
-    }
-
-    /// <summary>
-    /// Serialize a single entity, and store the results in <see cref="EntityData"/>.
-    /// </summary>
-    private void SerializeEntityInternal(EntityUid uid)
-    {
-        var saveId = GetYamlUid(uid);
-        DebugTools.Assert(!EntityData.ContainsKey(saveId));
-
-        // It might be possible that something could cause an entity to be included twice.
-        // E.g., if someone serializes a grid w/o its map, and then tries to separately include the map and all its children.
-        // In that case, the grid would already have been serialized as an orphan.
-        // uhhh.... I guess its fine?
-        if (EntityData.ContainsKey(saveId))
+            ReadEntitiesFallback();
             return;
-
-        var meta = _metaQuery.GetComponent(uid);
-        var protoId = meta.EntityPrototype?.ID ?? string.Empty;
-
-        switch (meta.EntityLifeStage)
-        {
-            case <= EntityLifeStage.Initializing:
-                _log.Error($"Encountered an uninitialized entity: {EntMan.ToPrettyString(uid)}");
-                break;
-            case >= EntityLifeStage.Terminating:
-                _log.Error($"Encountered terminating or deleted entity: {EntMan.ToPrettyString(uid)}");
-                break;
         }
 
-        CurrentEntityYamlUid = saveId;
-        CurrentEntity = (uid, meta);
-
-        Prototypes.GetOrNew(protoId).Add(saveId);
-        var xform = _xformQuery.GetComponent(uid);
-
-        if (_mapQuery.HasComp(uid))
-            Maps.Add(saveId);
-        else if (xform.ParentUid == EntityUid.Invalid)
-            Nullspace.Add(saveId);
-
-        if (_gridQuery.HasComp(uid))
+        var prototypeGroups = Data.Get<SequenceDataNode>("entities");
+        foreach (var protoGroup in prototypeGroups.Cast<MappingDataNode>())
         {
-            // The current assumption is that grids cannot be in null-space, because the rest of the code
-            // (broadphase, etc) don't support grids without maps.
-            DebugTools.Assert(xform.ParentUid != EntityUid.Invalid || _mapQuery.HasComp(uid));
-            Grids.Add(saveId);
-        }
-
-        var entData = new MappingDataNode
-        {
-            {"uid", saveId.ToString(CultureInfo.InvariantCulture)}
-        };
-
-        EntityData[saveId] = (uid, entData);
-        var cache = GetProtoCache(meta.EntityPrototype);
-
-        // Store information about whether a given entity has been map-initialized.
-        // In principle, if a map has been map-initialized, then all entities on that map should also be map-initialized.
-        // But technically there is nothing that prevents someone from moving a post-init entity onto a pre-init map and vice-versa.
-        // Also, we need to record this information even if the map is not being serialized.
-        // In 99% of cases, this data is probably redundant and just bloats the file, but I can't think of a better way of handling it.
-        // At least it should only bloat post-init maps, which aren't really getting used so far.
-        if (meta.EntityLifeStage == EntityLifeStage.MapInitialized)
-        {
-            if (Options.ExpectPreInit)
-                _log.Error($"Expected all entities to be pre-mapinit, but encountered post-init entity: {EntMan.ToPrettyString(uid)}");
-            entData.Add("mapInit", "true");
-
-            // If an entity has been map-initialized, we assume it is un-paused.
-            // If it is paused, we have to specify it.
-            if (meta.EntityPaused)
-                entData.Add("paused", "true");
-        }
-        else
-        {
-            // If an entity has not yet been map-initialized, we assume it is paused.
-            // I don't know in what situations it wouldn't be, but might as well future proof this.
-            if (!meta.EntityPaused)
-                entData.Add("paused", "false");
-        }
-
-        var components = new SequenceDataNode();
-        if (xform.NoLocalRotation && xform.LocalRotation != 0)
-        {
-            _log.Error($"Encountered a no-rotation entity with non-zero local rotation: {EntMan.ToPrettyString(uid)}");
-            xform._localRotation = 0;
-        }
-
-        try
-        {
-            SerializeComponents(uid, cache, components);
-        }
-        catch(Exception e)
-        {
-            if (Options.EntityExceptionBehaviour == EntityExceptionBehaviour.Rethrow)
+            EntProtoId? protoId = null;
+            var deletedPrototype = false;
+            if (protoGroup.TryGet("proto", out ValueDataNode? protoIdNode)
+                && !string.IsNullOrWhiteSpace(protoIdNode.Value))
             {
-                _log.Error($"Caught exception while serializing component {CurrentComponent} of entity {EntMan.ToPrettyString(uid)}");
-                throw;
+                if (DeletedPrototypes.Contains(protoIdNode.Value))
+                {
+                    deletedPrototype = true;
+                    if (_proto.HasIndex<EntityPrototype>(protoIdNode.Value))
+                        protoId = protoIdNode.Value;
+                }
+                else if (RenamedPrototypes.TryGetValue(protoIdNode.Value, out var newType))
+                    protoId = newType;
+                else
+                    protoId = protoIdNode.Value;
             }
 
-            _log.Error($"Caught exception while serializing component {CurrentComponent} of entity {EntMan.ToPrettyString(uid)}:\n{e}");
-            CurrentEntityYamlUid = 0;
-            CurrentEntity = null;
-            CurrentComponent = null;
-            RemoveErroringEntity(uid);
-            return;
+            var entities = (SequenceDataNode)protoGroup["entities"];
+            _proto.TryIndex(protoId, out var proto);
+
+            var protoData = Prototypes.GetOrNew(proto?.ID ?? string.Empty);
+            foreach (var entityNode in entities.Cast<MappingDataNode>())
+            {
+                var yamlId = entityNode.Get<ValueDataNode>("uid").AsInt();
+                var postInit = entityNode.TryGet("mapInit", out ValueDataNode? initNode) && initNode.AsBool();
+                var paused = entityNode.TryGet("paused", out ValueDataNode? pausedNode) ? pausedNode.AsBool() : !postInit;
+                var (comps, missing) = GetComponents(entityNode);
+                var entData = new EntData(yamlId, entityNode, comps, missing, postInit, paused, deletedPrototype);
+                protoData.Add(entData);
+                YamlEntities.Add(yamlId, entData);
+            }
         }
-
-        CurrentComponent = null;
-        if (components.Count != 0)
-            entData.Add("components", components);
-
-        // TODO ENTITY SERIALIZATION
-        // Consider adding a Action<EntityUid, MappingDataNode>? OnEntitySerialized
-        // I.e., allow content to modify the per-entity data? I don't know if that would actually be useful, as content
-        // could just as easily append a separate entity dictionary to the output that has the extra per-entity data they
-        // want to serialize.
-
-        if (meta.EntityPrototype == null)
-        {
-            CurrentEntityYamlUid = 0;
-            CurrentEntity = null;
-            return;
-        }
-
-        // an entity may have fewer components than the original prototype, so we need to check if any are missing.
-        SequenceDataNode? missingComponents = null;
-        foreach (var (name, comp) in meta.EntityPrototype.Components)
-        {
-            // try comp instead of has-comp as it checks whether the component is supposed to have been
-            // deleted.
-            if (EntMan.TryGetComponent(uid, comp.Component.GetType(), out _))
-                continue;
-
-            missingComponents ??= new();
-            missingComponents.Add(new ValueDataNode(name));
-        }
-
-        if (missingComponents != null)
-            entData.Add("missingComponents", missingComponents);
-
-        CurrentEntityYamlUid = 0;
-        CurrentEntity = null;
     }
 
-    /// <summary>
-    /// Remove an exception throwing entity (and possibly its children) from the serialized data.
-    /// </summary>
-    private void RemoveErroringEntity(EntityUid uid)
+    private void ReadEntitiesV3()
     {
-        if (Options.EntityExceptionBehaviour == EntityExceptionBehaviour.IgnoreEntityAndChildren)
+        var metadata = Data.Get<MappingDataNode>("meta");
+        var preInit = metadata.TryGet("postmapinit", out ValueDataNode? mapInitNode) && !mapInitNode.AsBool();
+
+        var entities = Data.Get<SequenceDataNode>("entities");
+        foreach (var entityNode in entities.Cast<MappingDataNode>())
         {
-            foreach (var child in _xformQuery.GetComponent(uid)._children)
+            var yamlId = entityNode.Get<ValueDataNode>("uid").AsInt();
+            EntProtoId? protoId = null;
+            var toDelete = false;
+            if (entityNode.TryGet("type", out ValueDataNode? protoIdNode))
             {
-                RemoveErroringEntity(child);
+                if (DeletedPrototypes.Contains(protoIdNode.Value))
+                {
+                    toDelete = true;
+                    if (_proto.HasIndex<EntityPrototype>(protoIdNode.Value))
+                        protoId = protoIdNode.Value;
+                }
+                else if (RenamedPrototypes.TryGetValue(protoIdNode.Value, out var newType))
+                    protoId = newType;
+                else
+                    protoId = protoIdNode.Value;
+            }
+
+            _proto.TryIndex(protoId, out var proto);
+            var protoData = Prototypes.GetOrNew(proto?.ID ?? string.Empty);
+            var (comps, missing) = GetComponents(entityNode);
+            var entData = new EntData(yamlId, entityNode, comps, missing, PostInit: !preInit, Paused: preInit, toDelete);
+            protoData.Add(entData);
+            YamlEntities.Add(yamlId, entData);
+        }
+    }
+
+    private void ReadEntitiesFallback()
+    {
+        var metadata = Data.Get<MappingDataNode>("meta");
+        var preInit = metadata.TryGet("postmapinit", out ValueDataNode? mapInitNode) && !mapInitNode.AsBool();
+
+        var prototypeGroups = Data.Get<SequenceDataNode>("entities");
+        foreach (var protoGroup in prototypeGroups.Cast<MappingDataNode>())
+        {
+            EntProtoId? protoId = null;
+            var deletedPrototype = false;
+            if (protoGroup.TryGet("proto", out ValueDataNode? protoIdNode)
+                && !string.IsNullOrWhiteSpace(protoIdNode.Value))
+            {
+                if (DeletedPrototypes.Contains(protoIdNode.Value))
+                {
+                    deletedPrototype = true;
+                    if (_proto.HasIndex<EntityPrototype>(protoIdNode.Value))
+                        protoId = protoIdNode.Value;
+                }
+                else if (RenamedPrototypes.TryGetValue(protoIdNode.Value, out var newType))
+                    protoId = newType;
+                else
+                    protoId = protoIdNode.Value;
+            }
+
+            var entities = (SequenceDataNode)protoGroup["entities"];
+            _proto.TryIndex(protoId, out var proto);
+
+            var protoData = Prototypes.GetOrNew(proto?.ID ?? string.Empty);
+            foreach (var entityNode in entities.Cast<MappingDataNode>())
+            {
+                var yamlId = entityNode.Get<ValueDataNode>("uid").AsInt();
+                var (comps, missing) = GetComponents(entityNode);
+                var entData = new EntData(yamlId, entityNode, comps, missing, PostInit: !preInit, Paused: preInit, ToDelete: deletedPrototype);
+                protoData.Add(entData);
+                YamlEntities.Add(yamlId, entData);
+            }
+        }
+    }
+
+    private (Dictionary<string, MappingDataNode>? Comps, HashSet<string>? Missing) GetComponents(MappingDataNode node)
+    {
+        Dictionary<string, MappingDataNode>? dict = null;
+        HashSet<string>? missing = null;
+
+        if (node.TryGet("components", out SequenceDataNode? componentList))
+        {
+            dict = new(componentList.Count);
+            foreach (var compData in componentList.Cast<MappingDataNode>())
+            {
+                var value = ((ValueDataNode)compData["type"]).Value;
+                compData.Remove("type");
+                dict.Add(value, compData);
             }
         }
 
-        ErroringEntities.Add(uid);
-        if (!YamlUidMap.TryGetValue(uid, out var yamlId))
-            return;
-
-        Nullspace.Remove(yamlId);
-        Orphans.Remove(yamlId);
-        Maps.Remove(yamlId);
-        Grids.Remove(yamlId);
-        EntityData.Remove(yamlId);
-        if (_metaQuery.TryGetComponent(uid, out var meta)
-            && meta.EntityPrototype != null
-            && Prototypes.TryGetValue(meta.EntityPrototype.ID, out var proto))
+        if (node.TryGet("missingComponents", out SequenceDataNode? missingComponentList))
         {
-            proto.Remove(yamlId);
+            missing = new(missingComponentList.Count);
+            foreach (var missNode in missingComponentList)
+                missing.Add(((ValueDataNode)missNode).Value);
         }
+
+        node.Remove("components");
+        node.Remove("missingComponents");
+        return (dict, missing);
     }
 
-    private void SerializeComponents(EntityUid uid, Dictionary<string, MappingDataNode>? cache, SequenceDataNode components)
+    private void ReadTileMap()
     {
-        foreach (var component in EntMan.GetComponentsInternal(uid))
+        _stopwatch.Restart();
+        var tileMap = Data.Get<MappingDataNode>("tilemap");
+        var migrations = new Dictionary<string, string>();
+        foreach (var proto in _proto.EnumeratePrototypes<TileAliasPrototype>())
+            migrations.Add(proto.ID, proto.Target);
+
+        foreach (var (key, value) in tileMap.Children)
         {
-            var compType = component.GetType();
+            var yamlTileId = int.Parse(key, CultureInfo.InvariantCulture);
+            var tileName = ((ValueDataNode)value).Value;
+            if (migrations.TryGetValue(tileName, out var @new))
+                tileName = @new;
 
-            var reg = _factory.GetRegistration(compType);
-            if (reg.Unsaved)
-                continue;
+            TileMap.Add(yamlTileId, tileName);
+        }
 
-            CurrentComponent = reg.Name;
-            MappingDataNode? compMapping;
-            MappingDataNode? protoMapping = null;
-            if (cache != null && cache.TryGetValue(reg.Name, out protoMapping))
+        _log.Debug($"Read tilemap in {_stopwatch.Elapsed}");
+    }
+
+    private void AllocateEntities()
+    {
+        _stopwatch.Restart();
+
+        foreach (var (protoId, ents) in Prototypes)
+        {
+            _proto.TryIndex(protoId, out var proto);
+
+            foreach (var ent in ents)
             {
-                // If this has a prototype, we need to use alwaysWrite: true.
-                // E.g., an anchored prototype might have anchored: true. If we we are saving an un-anchored
-                // instance of this entity, and if we have alwaysWrite: false, then compMapping would not include
-                // the anchored data-field (as false is the default for this bool data field), so the entity would
-                // implicitly be saved as anchored.
-                compMapping = _serialization.WriteValueAs<MappingDataNode>(compType, component, alwaysWrite: true, context: this);
+                // CHANGE: Critical fix for protection level. Use the internal AllocEntity and set prototype manually.
+                var entity = EntMan.AllocEntity(out var metadata);
+                metadata._entityPrototype = proto;
 
-                // This will not recursively call Except() on the values of the mapping. It will only remove
-                // key-value pairs if both the keys and values are equal.
-                compMapping = compMapping.Except(protoMapping);
-                if(compMapping == null)
+                Result.Entities.Add(entity);
+                UidMap.Add(ent.YamlId, entity);
+                Entities.Add(entity, ent);
+
+                if (ent.PostInit) PostMapInit.Add(entity);
+                if (ent.Paused) Paused.Add(entity);
+                if (ent.ToDelete) ToDelete.Add(entity);
+
+                if (Options.StoreYamlUids)
+                    EntMan.AddComponent<YamlUidComponent>(entity).Uid = ent.YamlId;
+            }
+        }
+
+        _log.Debug($"Allocated {Entities.Count} entities in {_stopwatch.Elapsed}");
+    }
+
+    private void ReadMapsAndGrids()
+    {
+        if (Result.Version < 7) return;
+        ReadYamlIdList(Data, "maps", MapYamlIds);
+        ReadYamlIdList(Data, "grids", GridYamlIds);
+        ReadYamlIdList(Data, "orphans", OrphanYamlIds);
+        ReadYamlIdList(Data, "nullspace", NullspaceYamlIds);
+    }
+
+    private void ReadYamlIdList(MappingDataNode data, string key, List<int> list)
+    {
+        var sequence = data.Get<SequenceDataNode>(key);
+        list.EnsureCapacity(sequence.Count);
+        foreach (var node in sequence)
+            list.Add(((ValueDataNode)node).AsInt());
+    }
+
+    private void LoadEntities()
+    {
+        _stopwatch.Restart();
+        foreach (var (entity, data) in Entities)
+        {
+#if EXCEPTION_TOLERANCE
+            try
+            {
+#endif
+            CurrentReadingEntity = data;
+            LoadEntity(entity, _metaQuery.Comp(entity), data.Components, data.MissingComponents);
+#if EXCEPTION_TOLERANCE
+            }
+            catch (Exception e)
+            {
+                ToDelete.Add(entity);
+                _log.Error($"Encountered error while loading entity. Yaml uid: {data.YamlId}. Loaded entity: {EntMan.ToPrettyString(entity)}. Error:\n{e}.");
+            }
+#endif
+        }
+
+        CurrentReadingEntity = null;
+        _log.Debug($"Loaded {Entities.Count} entities in {_stopwatch.Elapsed}");
+    }
+
+    private void LoadEntity(
+        EntityUid uid,
+        MetaDataComponent meta,
+        Dictionary<string, MappingDataNode>? comps,
+        HashSet<string>? missingComps)
+    {
+        var proto = meta.EntityPrototype;
+        _components.Clear();
+        if (comps != null)
+        {
+            _components.EnsureCapacity(comps.Count);
+            foreach (var (name, compData) in comps)
+            {
+                DebugTools.Assert(missingComps?.Contains(name) != true);
+
+                if (!_factory.TryGetRegistration(name, out _))
+                {
+                    if (!_factory.IsIgnored(name))
+                        _log.Error($"Encountered unregistered component ({name}) while loading entity {EntMan.ToPrettyString(uid)}");
                     continue;
-            }
-            else
-            {
-                compMapping = _serialization.WriteValueAs<MappingDataNode>(compType, component, alwaysWrite: false, context: this);
-            }
+                }
 
-            // Don't need to write it if nothing was written! Note that if this entity has no associated
-            // prototype, we ALWAYS want to write the component, because merely the fact that it exists is
-            // information that needs to be written.
-            if (compMapping.Children.Count == 0 && protoMapping != null)
-                continue;
+                var datanode = compData;
+                if (proto != null && proto.Components.TryGetValue(name, out var protoData))
+                    datanode = _seriMan.CombineMappings(compData, protoData.Mapping);
 
-            compMapping.InsertAt(0, "type", new ValueDataNode(reg.Name));
-            components.Add(compMapping);
+                _components.Add(name, datanode);
+            }
         }
-    }
 
-    private Dictionary<string, MappingDataNode>? GetProtoCache(EntityPrototype? proto)
-    {
-        if (proto == null)
-            return null;
-
-        if (PrototypeCache.TryGetValue(proto.ID, out var cache))
-            return cache;
-
-        PrototypeCache[proto.ID] = cache = new(proto.Components.Count);
-        WritingReadingPrototypes = true;
-
-        foreach (var (compName, comp) in proto.Components)
+        if (proto != null)
         {
-            CurrentComponent = compName;
-            cache.Add(compName, _serialization.WriteValueAs<MappingDataNode>(comp.Component.GetType(), comp.Component, alwaysWrite: true, context: this));
+            foreach (var (name, entry) in proto.Components)
+            {
+                if (missingComps?.Contains(name) == true)
+                    continue;
+
+                if (_components.ContainsKey(name))
+                    continue;
+
+                CurrentComponent = name;
+                var compReg = _factory.GetRegistration(name);
+
+                if (!EntMan.TryGetComponent(uid, compReg.Idx, out var component))
+                {
+                    var newComponent = _factory.GetComponent(compReg);
+                    EntMan.AddComponent(uid, newComponent);
+                    component = newComponent;
+                }
+
+                _seriMan.CopyTo(entry.Component, ref component, this, notNullableOverride: true);
+
+                if (!entry.Component.NetSyncEnabled && compReg.NetID is { } netId)
+                    meta.NetComponents.Remove(netId);
+            }
         }
 
+        foreach (var (name, data) in _components)
+        {
+            CurrentComponent = name;
+            var compReg = _factory.GetRegistration(name);
+            if (!EntMan.TryGetComponent(uid, compReg.Idx, out var existing))
+            {
+                var newComponent = (IComponent)_seriMan.Read(compReg.Type, data, this)!;
+
+                // TODO: Remove this legacy workaround when components no longer rely on Owner being set pre-injection.
+                if (newComponent is ISerializationHooks)
+                {
+                    existing = _factory.GetComponent(compReg);
+                    EntMan.AddComponent(uid, existing);
+                    _seriMan.CopyTo(newComponent, ref existing, this, notNullableOverride: true);
+                    continue;
+                }
+
+                _deps.InjectDependencies(newComponent);
+                EntMan.AddComponent(uid, newComponent);
+                continue;
+            }
+
+            var temp = (IComponent)_seriMan.Read(compReg.Type, data, this)!;
+            _seriMan.CopyTo(temp, ref existing, this, notNullableOverride: true);
+        }
+
+        _components.Clear();
         CurrentComponent = null;
-        WritingReadingPrototypes = false;
-        cache.TryAdd(_metaName, _emptyMetaNode);
-        cache.TryAdd(_xformName, _emptyXformNode);
-        return cache;
+        if (missingComps is { Count: > 0 })
+            meta.LastComponentRemoved = Timing.CurTick;
     }
 
-    #region Write
-
-    public MappingDataNode Write()
+    private void GetRootEntities()
     {
-        DebugTools.AssertEqual(Maps.ToHashSet().Count, Maps.Count, "Duplicate maps?");
-        DebugTools.AssertEqual(Grids.ToHashSet().Count, Grids.Count, "Duplicate grids?");
-        DebugTools.AssertEqual(Orphans.ToHashSet().Count, Orphans.Count, "Duplicate orphans?");
-        DebugTools.AssertEqual(Nullspace.ToHashSet().Count, Nullspace.Count, "Duplicate nullspace?");
-
-        return new MappingDataNode
+        if (Result.Version < 7)
         {
-            {"meta", WriteMetadata()},
-            {"maps", WriteIds(Maps)},
-            {"grids", WriteIds(Grids)},
-            {"orphans", WriteIds(Orphans)},
-            {"nullspace", WriteIds(Nullspace)},
-            {"tilemap", WriteTileMap()},
-            {"entities", WriteEntitySection()},
-        };
-    }
-
-    public MappingDataNode WriteMetadata()
-    {
-        return new MappingDataNode
-        {
-            {"format", MapFormatVersion.ToString(CultureInfo.InvariantCulture)},
-            {"category", GetCategory().ToString()},
-            {"engineVersion", _conf.GetCVar(CVars.BuildEngineVersion) },
-            {"forkId", _conf.GetCVar(CVars.BuildForkId)},
-            {"forkVersion", _conf.GetCVar(CVars.BuildVersion)},
-            {"time", DateTime.UtcNow.ToString(CultureInfo.InvariantCulture)},
-            {"entityCount", EntityData.Count.ToString(CultureInfo.InvariantCulture)}
-        };
-    }
-
-    public SequenceDataNode WriteIds(List<int> ids)
-    {
-        var result = new SequenceDataNode();
-        foreach (var id in ids)
-        {
-            result.Add(new ValueDataNode(id.ToString(CultureInfo.InvariantCulture)));
-        }
-        return result;
-    }
-
-    /// <summary>
-    /// Serialize the <see cref="_tileMap"/> to yaml. This data is required to deserialize any serialized grid chunks using <see cref="MapChunkSerializer"/>.
-    /// </summary>
-    public MappingDataNode WriteTileMap()
-    {
-        var map = new MappingDataNode();
-        foreach (var (tileId, yamlTileId) in _tileMap.OrderBy(x => x.Key))
-        {
-            // This can come up if tests try to serialize test maps with custom / placeholder tile ids without registering them with the tile def manager..
-            if (!_tileDef.TryGetDefinition(tileId, out var def))
-                throw new Exception($"Attempting to serialize a tile {tileId} with no valid tile definition.");
-
-            var yamlId = yamlTileId.ToString(CultureInfo.InvariantCulture);
-            map.Add(yamlId, def.ID);
-        }
-        return map;
-    }
-
-    public SequenceDataNode WriteEntitySection()
-    {
-        // Check that EntityData contains the expected number of entities.
-        if (Options.EntityExceptionBehaviour != EntityExceptionBehaviour.IgnoreEntity
-            && Options.EntityExceptionBehaviour != EntityExceptionBehaviour.IgnoreEntityAndChildren
-            && (YamlIds.Count != YamlUidMap.Count || YamlIds.Count != EntityData.Count))
-        {
-            // Maybe someone reserved a yaml id with ReserveYamlId() or implicitly with GetId() without actually
-            // ever serializing the entity, This can lead to references to non-existent entities.
-            throw new Exception($"Entity count mismatch");
+            GetRootEntitiesFallback();
+            return;
         }
 
-        var prototypes = new SequenceDataNode();
-        var protos = Prototypes.Keys.ToList();
-        protos.Sort(StringComparer.InvariantCulture);
-
-        foreach (var protoId in protos)
+        foreach (var yamlId in MapYamlIds)
         {
-            var entities = new SequenceDataNode();
-            var node = new MappingDataNode
+            var uid = UidMap[yamlId];
+            if (_mapQuery.TryComp(uid, out var map))
             {
-                { "proto", protoId },
-                { "entities", entities},
-            };
-
-            prototypes.Add(node);
-
-            var saveIds = Prototypes[protoId];
-            saveIds.Sort();
-            foreach (var saveId in saveIds)
-            {
-                var entData = EntityData[saveId].Node;
-                entities.Add(entData);
-            }
-        }
-
-        return prototypes;
-    }
-
-    /// <summary>
-    /// Get the category that the serialized data belongs to. If one was specified in the
-    /// <see cref="SerializationOptions"/> it will use that after validating it, otherwise it will attempt to infer a
-    /// category.
-    /// </summary>
-    public FileCategory GetCategory()
-    {
-        switch (Options.Category)
-        {
-            case FileCategory.Save:
-                return FileCategory.Save;
-
-            case FileCategory.Map:
-                return Maps.Count == 1 ? FileCategory.Map : FileCategory.Unknown;
-
-            case FileCategory.Grid:
-                if (Maps.Count > 0 || Grids.Count != 1)
-                    return FileCategory.Unknown;
-                return FileCategory.Grid;
-
-            case FileCategory.Entity:
-                if (Maps.Count > 0 || Grids.Count > 0 || Orphans.Count != 1)
-                    return FileCategory.Unknown;
-                return FileCategory.Entity;
-
-            default:
-                if (Maps.Count == 1)
-                {
-                    // Contains a single map, and no orphaned entities that need reparenting.
-                    if (Orphans.Count == 0)
-                        return FileCategory.Map;
-                }
-                else if (Grids.Count == 1)
-                {
-                    // Contains a single orphaned grid.
-                    if (Orphans.Count == 1 && Grids[0] == Orphans[0])
-                        return FileCategory.Grid;
-                }
-                else if (Orphans.Count == 1)
-                {
-                    // A lone orphaned entity.
-                    return FileCategory.Entity;
-                }
-
-                return FileCategory.Unknown;
-        }
-    }
-
-    #endregion
-
-    #region YamlIds
-
-    /// <summary>
-    /// Get (or allocate) the integer id that will be used in the serialized file to refer to the given entity.
-    /// </summary>
-    public int GetYamlUid(EntityUid uid)
-    {
-        return !YamlUidMap.TryGetValue(uid, out var id) ? AllocateYamlUid(uid) : id;
-    }
-
-    private int AllocateYamlUid(EntityUid uid)
-    {
-        if (Truncated.Contains(uid))
-        {
-            _log.Error(
-                "Including a previously truncated entity within the serialization process? Something probably wrong");
-        }
-
-        DebugTools.Assert(!YamlUidMap.ContainsKey(uid));
-        while (!YamlIds.Add(_nextYamlUid))
-        {
-            _nextYamlUid++;
-        }
-
-        YamlUidMap.Add(uid, _nextYamlUid);
-        return _nextYamlUid++;
-    }
-
-    /// <summary>
-    /// Get (or allocate) the integer id that will be used in the serialized file to refer to the given grid tile id.
-    /// </summary>
-    public int GetYamlTileId(int tileId)
-    {
-        if (_tileMap.TryGetValue(tileId, out var yamlId))
-            return yamlId;
-
-        return AllocateYamlTileId(tileId);
-    }
-
-    private int AllocateYamlTileId(int tileId)
-    {
-        while (!_yamlTileIds.Add(_nextYamlTileId))
-        {
-            _nextYamlTileId++;
-        }
-
-        _tileMap[tileId] = _nextYamlTileId;
-        return _nextYamlTileId++;
-    }
-
-    /// <summary>
-    /// This method ensures that the given entities have a yaml ids assigned. If the entities have a
-    /// <see cref="YamlUidComponent"/>, they will attempt to use that id, which exists to prevent large map file diffs
-    /// due to changing yaml ids.
-    /// </summary>
-    public void ReserveYamlIds(HashSet<EntityUid> entities)
-    {
-        List<EntityUid> needIds = new();
-        foreach (var uid in entities)
-        {
-            if (YamlUidMap.ContainsKey(uid))
-                continue;
-
-            if (_yamlQuery.TryGetComponent(uid, out var comp) && comp.Uid > 0 && YamlIds.Add(comp.Uid))
-            {
-                if (Truncated.Contains(uid))
-                {
-                    _log.Error(
-                        "Including a previously truncated entity within the serialization process? Something probably wrong");
-                }
-
-                YamlUidMap.Add(uid, comp.Uid);
+                Result.Maps.Add((uid, map));
+                EntMan.EnsureComponent<LoadedMapComponent>(uid);
             }
             else
-            {
-                needIds.Add(uid);
-            }
+                _log.Error($"Missing map entity: {EntMan.ToPrettyString(uid)}");
         }
 
-        foreach (var uid in needIds)
+        foreach (var yamlId in GridYamlIds)
         {
-            AllocateYamlUid(uid);
+            var uid = UidMap[yamlId];
+            if (_gridQuery.TryComp(uid, out var grid))
+                Result.Grids.Add((uid, grid));
+            else
+                _log.Error($"Missing grid entity: {EntMan.ToPrettyString(uid)}");
+        }
+
+        foreach (var yamlId in OrphanYamlIds)
+        {
+            var uid = UidMap[yamlId];
+            if (_mapQuery.HasComponent(uid) || _xformQuery.Comp(uid).ParentUid.IsValid())
+                _log.Error($"Entity {EntMan.ToPrettyString(uid)} was incorrectly labelled as an orphan?");
+            else
+                Result.Orphans.Add(uid);
+        }
+
+        foreach (var yamlId in NullspaceYamlIds)
+        {
+            var uid = UidMap[yamlId];
+            if (_mapQuery.HasComponent(uid) || _xformQuery.Comp(uid).ParentUid.IsValid())
+                _log.Error($"Entity {EntMan.ToPrettyString(uid)} was incorrectly labelled as a null-space entity?");
+            else
+                Result.NullspaceEntities.Add(uid);
         }
     }
 
-    /// <summary>
-    /// This method ensures that the given entity has a yaml id assigned to it. If the entity has a
-    /// <see cref="YamlUidComponent"/>, it will attempt to use that id, which exists to prevent large map file diffs due
-    /// to changing yaml ids.
-    /// </summary>
-    public void ReserveYamlId(EntityUid uid)
+    public void AssignMapIds()
     {
-        if (YamlUidMap.ContainsKey(uid))
-            return;
-
-        if (_yamlQuery.TryGetComponent(uid, out var comp) && comp.Uid > 0 && YamlIds.Add(comp.Uid))
-        {
-            if (Truncated.Contains(uid))
-            {
-                _log.Error(
-                    "Including a previously truncated entity within the serialization process? Something probably wrong");
-            }
-
-            YamlUidMap.Add(uid, comp.Uid);
-        }
-        else
-            AllocateYamlUid(uid);
+        foreach (var map in Result.Maps)
+            _map.AssignMapId(map);
     }
 
-    #endregion
+    private void GetRootEntitiesFallback()
+    {
+        foreach (var uid in Result.Entities)
+        {
+            if (_gridQuery.TryComp(uid, out var grid))
+            {
+                Result.Grids.Add((uid, grid));
+                if (_xformQuery.Comp(uid).ParentUid == EntityUid.Invalid && !_mapQuery.HasComp(uid))
+                    Result.Orphans.Add(uid);
+            }
+
+            if (_mapQuery.TryComp(uid, out var map))
+            {
+                Result.Maps.Add((uid, map));
+                EntMan.EnsureComponent<LoadedMapComponent>(uid);
+            }
+        }
+    }
+
+    private void RemoveEmptyChunks()
+    {
+        foreach (var uid in Entities.Keys)
+        {
+            if (!_gridQuery.TryGetComponent(uid, out var gridComp))
+                continue;
+
+            foreach (var (index, chunk) in gridComp.Chunks)
+            {
+                if (chunk.FilledTiles > 0)
+                    continue;
+
+                _log.Warning($"Encountered empty chunk while deserializing map. Grid: {EntMan.ToPrettyString(uid)}. Chunk index: {index}");
+                gridComp.Chunks.Remove(index);
+            }
+        }
+    }
+
+    private void StoreGridTileMap()
+    {
+        foreach (var entity in Result.Grids)
+            EntMan.EnsureComponent<MapSaveTileMapComponent>(entity).TileMap = TileMap.ShallowClone();
+    }
+
+    private void BuildEntityHierarchy()
+    {
+        _stopwatch.Restart();
+        var processed = new HashSet<EntityUid>(Result.Entities.Count);
+        foreach (var ent in Result.Entities)
+            BuildEntityHierarchy(ent, processed);
+        _log.Debug($"Built entity hierarchy for {Result.Entities.Count} entities in {_stopwatch.Elapsed}");
+    }
+
+    private void CheckCategory()
+    {
+        if (Result.Version < 7)
+        {
+            InferCategory();
+            return;
+        }
+
+        switch (Result.Category)
+        {
+            case FileCategory.Map:
+                if (Result.Maps.Count == 1 && Result.Orphans.Count == 0) return;
+                _log.Error($"Expected file to contain a single map, but instead found {Result.Maps.Count} maps and {Result.Orphans.Count} orphans");
+                break;
+            case FileCategory.Grid:
+                if (Result.Maps.Count == 0 && Result.Grids.Count == 1 && Result.Orphans.Count == 1 && Result.Orphans.First() == Result.Grids.First().Owner) return;
+                _log.Error($"Expected file to contain a single grid, but instead found {Result.Grids.Count} grids and {Result.Orphans.Count} orphans");
+                break;
+            case FileCategory.Entity:
+                if (Result.Maps.Count == 0 && Result.Grids.Count == 0 && Result.Orphans.Count == 1) return;
+                _log.Error($"Expected file to contain a orphaned entity, but instead found {Result.Orphans.Count} orphans");
+                break;
+            case FileCategory.Save:
+            default:
+                return;
+        }
+    }
+
+    private void InferCategory()
+    {
+        if (Result.Category != FileCategory.Unknown) return;
+        if (Result.Maps.Count == 1) Result.Category = FileCategory.Map;
+        else if (Result.Maps.Count == 0 && Result.Grids.Count == 1) Result.Category = FileCategory.Grid;
+    }
+
+    private void AdoptGrids()
+    {
+        foreach (var grid in Result.Grids)
+        {
+            if (_mapQuery.HasComponent(grid.Owner))
+                continue;
+
+            var xform = _xformQuery.Comp(grid.Owner);
+            if (xform.ParentUid.IsValid())
+                continue;
+
+            DebugTools.Assert(Result.Orphans.Contains(grid.Owner));
+            if (Options.LogOrphanedGrids)
+                _log.Error($"Encountered an orphaned grid. Automatically creating a map for the grid.");
+
+            var map = _map.CreateUninitializedMap();
+            _map.AssignMapId(map);
+            Result.Entities.Add(map);
+            Result.Maps.Add(map);
+            Result.Orphans.Remove(grid.Owner);
+            xform._parent = map.Owner;
+            DebugTools.Assert(!xform._mapIdInitialized);
+        }
+    }
+
+    private void ValidateMapIds()
+    {
+        foreach (var map in Result.Maps)
+        {
+            if (map.Comp.MapId == MapId.Nullspace || !_map.TryGetMap(map.Comp.MapId, out var e) || e != map.Owner)
+                throw new Exception($"Map entity {EntMan.ToPrettyString(map)} has not been assigned a map id");
+        }
+    }
+
+    private void PauseMaps()
+    {
+        if (!Options.PauseMaps) return;
+        foreach (var ent in Result.Maps)
+            _map.SetPaused(ent!, true);
+    }
+
+    private void BuildEntityHierarchy(EntityUid uid, HashSet<EntityUid> processed)
+    {
+        if (!processed.Add(uid)) return;
+        if (!_xformQuery.TryComp(uid, out var xform)) return;
+
+        var parent = xform.ParentUid;
+        if (parent != EntityUid.Invalid)
+            BuildEntityHierarchy(parent, processed);
+
+        if (!Result.Entities.Contains(uid)) return;
+        SortedEntities.Add(uid);
+    }
+
+    private void StartEntitiesInternal()
+    {
+        _stopwatch.Restart();
+        foreach (var uid in SortedEntities)
+            StartupEntity(uid, _metaQuery.GetComponent(uid));
+        _log.Debug($"Started up {Result.Entities.Count} entities in {_stopwatch.Elapsed}");
+    }
+
+    private void StartupEntity(EntityUid uid, MetaDataComponent metadata)
+    {
+        ResetNetTicks(uid, metadata);
+        EntMan.InitializeEntity(uid, metadata);
+        EntMan.StartEntity(uid);
+    }
+
+    private void ResetNetTicks(EntityUid uid, MetaDataComponent metadata)
+    {
+        if (!Entities.TryGetValue(uid, out var entData)) return;
+        if (metadata.EntityPrototype is not { } prototype) return;
+        if (entData.Components == null) return;
+
+        foreach (var component in metadata.NetComponents.Values)
+        {
+            var compName = _factory.GetComponentName(component.GetType());
+            if (!entData.Components.ContainsKey(compName))
+            {
+                component.ClearTicks();
+                continue;
+            }
+            if (prototype.Components.ContainsKey(compName))
+                component.ClearCreationTick();
+        }
+    }
+
+    private void SetMapInitLifestage()
+    {
+        if (PostMapInit.Count == 0) return;
+        _stopwatch.Restart();
+        foreach (var uid in PostMapInit)
+        {
+            if (!_metaQuery.TryComp(uid, out var meta)) continue;
+            DebugTools.Assert(meta.EntityLifeStage == EntityLifeStage.Initialized);
+            EntMan.SetLifeStage(meta, EntityLifeStage.MapInitialized);
+        }
+        _log.Debug($"Finished flagging mapinit in {_stopwatch.Elapsed}");
+    }
+
+    private void SetPaused()
+    {
+        if (Paused.Count == 0) return;
+        _stopwatch.Restart();
+        var time = Timing.CurTime;
+        var ev = new EntityPausedEvent();
+        foreach (var uid in Paused)
+        {
+            if (!_metaQuery.TryComp(uid, out var meta)) continue;
+            meta.PauseTime = time;
+            EntMan.EventBus.RaiseLocalEvent(uid, ref ev);
+        }
+        _log.Debug($"Finished setting PauseTime in {_stopwatch.Elapsed}");
+    }
+
+    private void InitializeMaps()
+    {
+        if (!Options.InitializeMaps)
+        {
+            if (Options.PauseMaps) return;
+            foreach (var ent in Result.Maps)
+            {
+                if (_metaQuery.Comp(ent.Owner).EntityLifeStage < EntityLifeStage.MapInitialized)
+                    _map.SetPaused(ent!, true);
+            }
+            return;
+        }
+
+        foreach (var ent in Result.Maps)
+        {
+            if (!ent.Comp.MapInitialized)
+                _map.InitializeMap(ent!, unpause: !Options.PauseMaps);
+        }
+    }
+
+    private void ProcessDeletions()
+    {
+        foreach (var uid in ToDelete)
+        {
+            EntMan.DeleteEntity(uid);
+            Result.Entities.Remove(uid);
+        }
+    }
+
+    private void GetRootNodes()
+    {
+        Result.RootNodes.UnionWith(Result.Orphans);
+        Result.RootNodes.UnionWith(Result.NullspaceEntities);
+        foreach (var map in Result.Maps)
+            Result.RootNodes.Add(map.Owner);
+    }
 
     #region ITypeSerializer
 
-    ValidationNode ITypeValidator<EntityUid, ValueDataNode>.Validate(
-        ISerializationManager serializationManager,
-        ValueDataNode node,
-        IDependencyCollection dependencies,
-        ISerializationContext? context)
+    ValidationNode ITypeValidator<EntityUid, ValueDataNode>.Validate(ISerializationManager s, ValueDataNode n, IDependencyCollection d, ISerializationContext? c)
     {
-        if (node.Value == "invalid")
-            return new ValidatedValueNode(node);
-
-        if (!int.TryParse(node.Value, out _))
-            return new ErrorNode(node, "Invalid EntityUid");
-
-        return new ValidatedValueNode(node);
+        if (n.Value is "invalid" || int.TryParse(n.Value, out _))
+            return new ValidatedValueNode(n);
+        return new ErrorNode(n, "Invalid EntityUid");
     }
 
-    public DataNode Write(
-        ISerializationManager serializationManager,
-        EntityUid value,
-        IDependencyCollection dependencies,
-        bool alwaysWrite = false,
-        ISerializationContext? context = null)
+    DataNode ITypeWriter<EntityUid>.Write(ISerializationManager s, EntityUid v, IDependencyCollection d, bool a, ISerializationContext? c)
     {
-        if (YamlUidMap.TryGetValue(value, out var yamlId))
-            return new ValueDataNode(yamlId.ToString(CultureInfo.InvariantCulture));
+        return v.IsValid() ? new ValueDataNode(v.Id.ToString(CultureInfo.InvariantCulture)) : new ValueDataNode("invalid");
+    }
 
-        if (CurrentComponent == _xformName)
+    EntityUid ITypeReader<EntityUid, ValueDataNode>.Read(ISerializationManager s, ValueDataNode n, IDependencyCollection d, SerializationHookContext h, ISerializationContext? c, ISerializationManager.InstantiationDelegate<EntityUid>? _)
+    {
+        if (n.Value == "invalid")
         {
-            if (value == EntityUid.Invalid)
-                return new ValueDataNode("invalid");
+            if (CurrentComponent == "Transform") return EntityUid.Invalid;
+            if (!Options.LogInvalidEntities) return EntityUid.Invalid;
 
-            DebugTools.Assert(!Orphans.Contains(CurrentEntityYamlUid));
-            Orphans.Add(CurrentEntityYamlUid);
-
-            if (Options.ErrorOnOrphan && CurrentEntity != null && value != Truncate && !ErroringEntities.Contains(value))
-                _log.Error($"Serializing entity {EntMan.ToPrettyString(CurrentEntity)} without including its parent {EntMan.ToPrettyString(value)}");
-
-            return new ValueDataNode("invalid");
+            var msg = CurrentReadingEntity is not { } curr
+                ? "Encountered invalid EntityUid reference"
+                : $"Encountered invalid EntityUid reference while reading entity {curr.YamlId}, component: {CurrentComponent}";
+            _log.Error(msg);
+            return EntityUid.Invalid;
         }
 
-        if (ErroringEntities.Contains(value))
-        {
-            // Referenced entity already logged an error, so we just silently fail.
-            return new ValueDataNode("invalid");
-        }
+        if (int.TryParse(n.Value, out var val) && UidMap.TryGetValue(val, out var entity))
+            return entity;
 
-        if (value == EntityUid.Invalid)
-        {
-            if (Options.MissingEntityBehaviour != MissingEntityBehaviour.Ignore)
-                _log.Error($"Encountered an invalid entityUid reference.");
-
-            return new ValueDataNode("invalid");
-        }
-
-        if (value == Truncate)
-        {
-            _log.Error(
-                $"{EntMan.ToPrettyString(CurrentEntity)}:{CurrentComponent} is attempting to serialize references to a truncated entity {EntMan.ToPrettyString(Truncate)}.");
-        }
-
-        switch (Options.MissingEntityBehaviour)
-        {
-            case MissingEntityBehaviour.Error:
-                _log.Error(EntMan.Deleted(value)
-                    ? $"Encountered a reference to a deleted entity {value} while serializing {EntMan.ToPrettyString(CurrentEntity)}."
-                    : $"Encountered a reference to a missing entity: {value} while serializing {EntMan.ToPrettyString(CurrentEntity)}.");
-                return new ValueDataNode("invalid");
-            case MissingEntityBehaviour.Ignore:
-                return new ValueDataNode("invalid");
-            case MissingEntityBehaviour.IncludeNullspace:
-                if (!EntMan.TryGetComponent(value, out TransformComponent? xform)
-                    || xform.ParentUid != EntityUid.Invalid
-                    || _gridQuery.HasComp(value)
-                    || _mapQuery.HasComp(value))
-                {
-                    goto case MissingEntityBehaviour.Error;
-                }
-                goto case MissingEntityBehaviour.AutoInclude;
-            case MissingEntityBehaviour.PartialInclude:
-            case MissingEntityBehaviour.AutoInclude:
-                if (Options.LogAutoInclude is {} level)
-                    _log.Log(level, $"Auto-including entity {EntMan.ToPrettyString(value)} referenced by {EntMan.ToPrettyString(CurrentEntity)}");
-                _autoInclude.Add(value);
-                var id = GetYamlUid(value);
-                return new ValueDataNode(id.ToString(CultureInfo.InvariantCulture));
-            default:
-                throw new ArgumentOutOfRangeException();
-        }
+        _log.Error($"Invalid yaml entity id: '{val}'");
+        return EntityUid.Invalid;
     }
 
-    EntityUid ITypeReader<EntityUid, ValueDataNode>.Read(
-        ISerializationManager serializationManager,
-        ValueDataNode node,
-        IDependencyCollection dependencies,
-        SerializationHookContext hookCtx,
-        ISerializationContext? context,
-        ISerializationManager.InstantiationDelegate<EntityUid>? _)
+    ValidationNode ITypeValidator<NetEntity, ValueDataNode>.Validate(ISerializationManager s, ValueDataNode n, IDependencyCollection d, ISerializationContext? c)
     {
-        return node.Value == "invalid" ? EntityUid.Invalid : EntityUid.Parse(node.Value);
+        if (n.Value is "invalid" || int.TryParse(n.Value, out _))
+            return new ValidatedValueNode(n);
+        return new ErrorNode(n, "Invalid NetEntity");
     }
 
-    public ValidationNode Validate(
-        ISerializationManager serializationManager,
-        ValueDataNode node,
-        IDependencyCollection dependencies,
-        ISerializationContext? context = null)
+    NetEntity ITypeReader<NetEntity, ValueDataNode>.Read(ISerializationManager s, ValueDataNode n, IDependencyCollection d, SerializationHookContext h, ISerializationContext? c, ISerializationManager.InstantiationDelegate<NetEntity>? p)
     {
-        if (node.Value == "invalid")
-            return new ValidatedValueNode(node);
+        var uid = s.Read<EntityUid>(n, c);
+        if (EntMan.TryGetNetEntity(uid, out var nent))
+            return nent.Value;
 
-        if (!int.TryParse(node.Value, out _))
-            return new ErrorNode(node, "Invalid NetEntity");
-
-        return new ValidatedValueNode(node);
+        _log.Error($"Failed to get NetEntity for entity {EntMan.ToPrettyString(uid)}");
+        return NetEntity.Invalid;
     }
 
-    public NetEntity Read(
-        ISerializationManager serializationManager,
-        ValueDataNode node,
-        IDependencyCollection dependencies,
-        SerializationHookContext hookCtx,
-        ISerializationContext? context = null,
-        ISerializationManager.InstantiationDelegate<NetEntity>? instanceProvider = null)
+    DataNode ITypeWriter<NetEntity>.Write(ISerializationManager s, NetEntity v, IDependencyCollection d, bool a, ISerializationContext? c)
     {
-        return node.Value == "invalid" ? NetEntity.Invalid : NetEntity.Parse(node.Value);
-    }
-
-    public DataNode Write(
-        ISerializationManager serializationManager,
-        NetEntity value,
-        IDependencyCollection dependencies,
-        bool alwaysWrite = false,
-        ISerializationContext? context = null)
-    {
-        var uid = EntMan.GetEntity(value);
-        return serializationManager.WriteValue(uid, alwaysWrite, context);
-    }
-
-    ValidationNode ITypeValidator<MapId, ValueDataNode>.Validate(
-        ISerializationManager seri,
-        ValueDataNode node,
-        IDependencyCollection deps,
-        ISerializationContext? context)
-    {
-        return seri.ValidateNode<EntityUid>(node, context);
-    }
-
-    MapId ITypeReader<MapId, ValueDataNode>.Read(
-        ISerializationManager seri,
-        ValueDataNode node,
-        IDependencyCollection deps,
-        SerializationHookContext hookCtx,
-        ISerializationContext? ctx,
-        ISerializationManager.InstantiationDelegate<MapId>? instanceProvider)
-    {
-        return EntMan.TryGetComponent(seri.Read<EntityUid>(node, ctx), out MapComponent? mapComp)
-            ? mapComp.MapId
-            : MapId.Nullspace;
-    }
-
-    DataNode ITypeWriter<MapId>.Write(
-        ISerializationManager seri,
-        MapId value,
-        IDependencyCollection deps,
-        bool alwaysWrite,
-        ISerializationContext? ctx)
-    {
-        if (_map.TryGetMap(value, out var uid))
-            return seri.WriteValue(uid, alwaysWrite, ctx);
-
-        _log.Error($"Attempted to serialize invalid map id {value} while serializing component '{CurrentComponent}' on entity '{EntMan.ToPrettyString(uid)}'");
-        return new ValueDataNode("invalid");
+        return v.IsValid() ? new ValueDataNode(v.Id.ToString(CultureInfo.InvariantCulture)) : new ValueDataNode("invalid");
     }
 
     #endregion

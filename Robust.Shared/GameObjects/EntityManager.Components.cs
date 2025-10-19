@@ -24,6 +24,9 @@ namespace Robust.Shared.GameObjects
     /// <inheritdoc />
     public partial class EntityManager
     {
+
+        #region Dependencies and Internal State
+
         [IoC.Dependency] private readonly IComponentFactory _componentFactory = default!;
 
 #if EXCEPTION_TOLERANCE
@@ -37,22 +40,42 @@ namespace Robust.Shared.GameObjects
         private const int EntityCapacity = 1024;
         private const int NetComponentCapacity = 8;
 
+        /// <summary>
+        /// Stores components mapped by their concrete type. Used for lookups via <see cref="Type"/>.
+        /// </summary>
         private FrozenDictionary<Type, Dictionary<EntityUid, IComponent>> _entTraitDict
             = FrozenDictionary<Type, Dictionary<EntityUid, IComponent>>.Empty;
 
+        /// <summary>
+        /// Stores components mapped by their <see cref="CompIdx"/>. This is an array for performance.
+        /// </summary>
         private Dictionary<EntityUid, IComponent>[] _entTraitArray
             = Array.Empty<Dictionary<EntityUid, IComponent>>();
 
+        /// <summary>
+        /// A set of components that are marked for deferred deletion.
+        /// </summary>
         private readonly HashSet<IComponent> _deleteSet = new(TypeCapacity);
 
+        /// <summary>
+        /// An index mapping an EntityUid to all of its associated components.
+        /// </summary>
         private UniqueIndexHkm<EntityUid, IComponent> _entCompIndex =
             new(ComponentCollectionCapacity);
+
+        #endregion
+
+        #region Public Events
 
         /// <inheritdoc />
         public event Action<AddedComponentEventArgs>? ComponentAdded;
 
         /// <inheritdoc />
         public event Action<RemovedComponentEventArgs>? ComponentRemoved;
+
+        #endregion
+
+        #region Initialization and Cleanup
 
         public void InitializeComponents()
         {
@@ -94,22 +117,16 @@ namespace Robust.Shared.GameObjects
             RegisterComponents(components);
         }
 
-        #region Component Management
-
-        /// <inheritdoc />
-        public int Count<T>() where T : IComponent
+        private void FillComponentDict()
         {
-            var dict = _entTraitDict[typeof(T)];
-            return dict.Count;
+            _entTraitDict = FrozenDictionary<Type, Dictionary<EntityUid, IComponent>>.Empty;
+            Array.Fill(_entTraitArray, null);
+            RegisterComponents(_componentFactory.GetAllRegistrations());
         }
 
-        /// <inheritdoc />
-        public int Count(Type component)
-        {
-            DebugTools.Assert(component.IsAssignableTo(typeof(IComponent)));
-            var dict = _entTraitDict[component];
-            return dict.Count;
-        }
+        #endregion
+
+        #region Obsolete Lifecycle Methods
 
         [Obsolete("Use InitializeEntity")]
         public void InitializeComponents(EntityUid uid, MetaDataComponent? metadata = null)
@@ -127,7 +144,7 @@ namespace Robust.Shared.GameObjects
 
             foreach (var comp in comps)
             {
-                if (comp is {LifeStage: ComponentLifeStage.Added})
+                if (comp is { LifeStage: ComponentLifeStage.Added })
                     LifeInitialize(uid, comp, _componentFactory.GetIndex(comp.GetType()));
             }
 
@@ -178,6 +195,10 @@ namespace Robust.Shared.GameObjects
             }
         }
 
+        #endregion
+
+        #region Component Adding
+
         /// <inheritdoc />
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void AddComponents(EntityUid target, EntityPrototype prototype, bool removeExisting = true)
@@ -217,27 +238,6 @@ namespace Robust.Shared.GameObjects
             }
         }
 
-        /// <inheritdoc />
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public void RemoveComponents(EntityUid target, EntityPrototype prototype)
-        {
-            RemoveComponents(target, prototype.Components);
-        }
-
-        /// <inheritdoc />
-        public void RemoveComponents(EntityUid target, ComponentRegistry registry)
-        {
-            if (registry.Count == 0)
-                return;
-
-            var metadata = MetaQuery.GetComponent(target);
-
-            foreach (var entry in registry.Values)
-            {
-                RemoveComponent(target, entry.Component.GetType(), metadata);
-            }
-        }
-
         public IComponent AddComponent(EntityUid uid, ushort netId, MetaDataComponent? meta = null)
         {
             var newComponent = _componentFactory.GetComponent(netId);
@@ -252,6 +252,10 @@ namespace Robust.Shared.GameObjects
             return newComponent;
         }
 
+        /// <summary>
+        /// A handle that ensures a component is properly initialized after being added,
+        /// even outside the normal entity initialization flow.
+        /// </summary>
         public readonly struct CompInitializeHandle<T> : IDisposable
             where T : IComponent
         {
@@ -276,10 +280,10 @@ namespace Robust.Shared.GameObjects
                     return;
 
                 if (!Comp.Initialized)
-                    ((EntityManager) _entMan).LifeInitialize(_owner, Comp, CompType);
+                    ((EntityManager)_entMan).LifeInitialize(_owner, Comp, CompType);
 
                 if (metadata.EntityInitialized && !Comp.Running)
-                    ((EntityManager) _entMan).LifeStartup(_owner, Comp, CompType);
+                    ((EntityManager)_entMan).LifeStartup(_owner, Comp, CompType);
             }
 
             public static implicit operator T(CompInitializeHandle<T> handle)
@@ -307,7 +311,8 @@ namespace Robust.Shared.GameObjects
             if (component == null)
                 throw new ArgumentNullException(nameof(component));
 
-#pragma warning disable CS0618 // Type or member is obsolete
+
+            #pragma warning disable CS0618 // Owner is obsolete, but we are the one setting it here.
             if (component.Owner == default)
             {
                 component.Owner = uid;
@@ -316,7 +321,9 @@ namespace Robust.Shared.GameObjects
             {
                 throw new InvalidOperationException("Component is not owned by entity.");
             }
-#pragma warning restore CS0618 // Type or member is obsolete
+            #pragma warning restore CS0618
+
+
 
             AddComponentInternal(uid, component, overwrite, false, metadata);
         }
@@ -331,8 +338,10 @@ namespace Robust.Shared.GameObjects
             if (!MetaQuery.Resolve(uid, ref metadata, false))
                 throw new ArgumentException($"Entity {uid} is not valid.", nameof(uid));
 
+            #pragma warning disable CS0618 // Owner is obsolete, but required to raise the event correctly.
             DebugTools.Assert(component.Owner == default);
             component.Owner = uid;
+            #pragma warning restore CS0618 // Owner is obsolete, but required to raise the event correctly.
 
             AddComponentInternal(uid, component, compReg, overwrite, skipInit: false, metadata);
         }
@@ -353,7 +362,7 @@ namespace Robust.Shared.GameObjects
 
             // We can't use typeof(T) here in case T is just Component
             DebugTools.Assert(component is MetaDataComponent ||
-                              (metadata ?? MetaQuery.GetComponent(uid)).EntityLifeStage < EntityLifeStage.Terminating,
+                            (metadata ?? MetaQuery.GetComponent(uid)).EntityLifeStage < EntityLifeStage.Terminating,
                 $"Attempted to add a {component.GetType().Name} component to an entity ({ToPrettyString(uid)}) while it is terminating");
 
             // Check that there is no existing component.
@@ -429,6 +438,10 @@ namespace Robust.Shared.GameObjects
             if (metadata.EntityLifeStage >= EntityLifeStage.MapInitialized)
                 EventBus.RaiseComponentEvent(uid, component, reg.Idx, MapInitEventInstance);
         }
+
+        #endregion
+
+        #region Component Removal
 
         /// <inheritdoc />
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -518,6 +531,9 @@ namespace Robust.Shared.GameObjects
             RemoveComponentDeferred(component, owner, false);
         }
 
+        /// <summary>
+        /// Orders a component collection to ensure critical components (Meta, Transform, Physics) are processed first or last.
+        /// </summary>
         private static IEnumerable<IComponent> InSafeOrder(IEnumerable<IComponent> comps, bool forCreation = false)
         {
             static int Sequence(IComponent x)
@@ -568,6 +584,10 @@ namespace Robust.Shared.GameObjects
 
             _entCompIndex.Remove(uid);
         }
+
+        #endregion
+
+        #region Internal Removal Logic
 
         private void RemoveComponentDeferred(IComponent component, EntityUid uid, bool terminating)
         {
@@ -658,7 +678,7 @@ namespace Robust.Shared.GameObjects
             }
             catch (Exception e)
             {
-                _sawmill.Error($"Caught exception during immediate component removal. Entity={ToPrettyString(component.Owner)}, type={component.GetType()}");
+                _sawmill.Error($"Caught exception during immediate component removal. Entity={ToPrettyString(uid)}, type={component.GetType()}");
                 _runtimeLog.LogException(e, nameof(RemoveComponentImmediate));
             }
 #endif
@@ -672,7 +692,9 @@ namespace Robust.Shared.GameObjects
             {
                 if (component.Deleted)
                     continue;
+                #pragma warning disable CS0618 // Owner is obsolete, but required to raise the event correctly.
                 var uid = component.Owner;
+                #pragma warning restore CS0618 // Owner is obsolete, but required to raise the event correctly.
                 var idx = _componentFactory.GetIndex(component.GetType());
 
 #if EXCEPTION_TOLERANCE
@@ -743,7 +765,26 @@ namespace Robust.Shared.GameObjects
             _entCompIndex.Remove(entityUid, component);
 
             DebugTools.Assert(_netMan.IsClient // Client side prediction can set LastComponentRemoved to some future tick,
-                              || metadata.EntityLastModifiedTick >= metadata.LastComponentRemoved);
+                            || metadata.EntityLastModifiedTick >= metadata.LastComponentRemoved);
+        }
+
+        #endregion
+
+        #region Component Checks and Counts
+
+        /// <inheritdoc />
+        public int Count<T>() where T : IComponent
+        {
+            var dict = _entTraitDict[typeof(T)];
+            return dict.Count;
+        }
+
+        /// <inheritdoc />
+        public int Count(Type component)
+        {
+            DebugTools.Assert(component.IsAssignableTo(typeof(IComponent)));
+            var dict = _entTraitDict[component];
+            return dict.Count;
         }
 
         /// <inheritdoc />
@@ -820,6 +861,10 @@ namespace Robust.Shared.GameObjects
             return HasComponent(uid.Value, netId, meta);
         }
 
+        #endregion
+
+        #region Component Manipulation (Ensure & Copy)
+
         /// <inheritdoc />
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public T EnsureComponent<T>(EntityUid uid) where T : IComponent, new()
@@ -874,6 +919,103 @@ namespace Robust.Shared.GameObjects
             component = AddComponent<T>(entity);
             return false;
         }
+
+        /// <inheritdoc/>
+        public bool TryCopyComponent<T>(EntityUid source, EntityUid target, ref T? sourceComponent, [NotNullWhen(true)] out T? targetComp, MetaDataComponent? meta = null) where T : IComponent
+        {
+            if (!MetaQuery.Resolve(target, ref meta))
+            {
+                targetComp = default;
+                return false;
+            }
+
+            if (sourceComponent == null && !TryGetComponent(source, out sourceComponent))
+            {
+                targetComp = default;
+                return false;
+            }
+
+            targetComp = CopyComponentInternal(source, target, sourceComponent, meta);
+            return true;
+        }
+
+        /// <inheritdoc/>
+        public bool TryCopyComponents(
+            EntityUid source,
+            EntityUid target,
+            MetaDataComponent? meta = null,
+            params Type[] sourceComponents)
+        {
+            if (!MetaQuery.TryGetComponent(target, out meta))
+                return false;
+
+            var allCopied = true;
+
+            foreach (var type in sourceComponents)
+            {
+                if (!TryGetComponent(source, type, out var srcComp))
+                {
+                    allCopied = false;
+                    continue;
+                }
+
+                CopyComponent(source, target, srcComp, meta: meta);
+            }
+
+            return allCopied;
+        }
+
+        /// <inheritdoc/>
+        public IComponent CopyComponent(EntityUid source, EntityUid target, IComponent sourceComponent, MetaDataComponent? meta = null)
+        {
+            if (!MetaQuery.Resolve(target, ref meta))
+            {
+                throw new InvalidOperationException();
+            }
+
+            return CopyComponentInternal(source, target, sourceComponent, meta);
+        }
+
+        /// <inheritdoc/>
+        public T CopyComponent<T>(EntityUid source, EntityUid target, T sourceComponent, MetaDataComponent? meta = null) where T : IComponent
+        {
+            if (!MetaQuery.Resolve(target, ref meta))
+            {
+                throw new InvalidOperationException();
+            }
+
+            return CopyComponentInternal(source, target, sourceComponent, meta);
+        }
+
+        /// <inheritdoc/>
+        public void CopyComponents(EntityUid source, EntityUid target, MetaDataComponent? meta = null, params IComponent[] sourceComponents)
+        {
+            if (!MetaQuery.Resolve(target, ref meta))
+                return;
+
+            foreach (var comp in sourceComponents)
+            {
+                CopyComponentInternal(source, target, comp, meta);
+            }
+        }
+
+        private T CopyComponentInternal<T>(EntityUid source, EntityUid target, T sourceComponent, MetaDataComponent meta) where T : IComponent
+        {
+            var compReg = ComponentFactory.GetRegistration(sourceComponent.GetType());
+            var component = (T)ComponentFactory.GetComponent(compReg);
+
+            _serManager.CopyTo(sourceComponent, ref component, notNullableOverride: true);
+            #pragma warning disable CS0618 // Owner is obsolete, but required to raise the event correctly.
+            component.Owner = target;
+            #pragma warning restore CS0618 // Owner is obsolete, but required to raise the event correctly.
+
+            AddComponentInternal(target, component, compReg, true, false, meta);
+            return component;
+        }
+
+        #endregion
+
+        #region Component Retrieval
 
         /// <inheritdoc />
         [Pure]
@@ -1086,110 +1228,9 @@ namespace Robust.Shared.GameObjects
             return TryGetComponent(uid.Value, netId, out component, meta);
         }
 
-        /// <inheritdoc/>
-        public bool TryCopyComponent<T>(EntityUid source, EntityUid target, ref T? sourceComponent, [NotNullWhen(true)] out T? targetComp, MetaDataComponent? meta = null) where T : IComponent
-        {
-            if (!MetaQuery.Resolve(target, ref meta))
-            {
-                targetComp = default;
-                return false;
-            }
+        #endregion
 
-            if (sourceComponent == null && !TryGetComponent(source, out sourceComponent))
-            {
-                targetComp = default;
-                return false;
-            }
-
-            targetComp = CopyComponentInternal(source, target, sourceComponent, meta);
-            return true;
-        }
-
-        /// <inheritdoc/>
-        public bool TryCopyComponents(
-            EntityUid source,
-            EntityUid target,
-            MetaDataComponent? meta = null,
-            params Type[] sourceComponents)
-        {
-            if (!MetaQuery.TryGetComponent(target, out meta))
-                return false;
-
-            var allCopied = true;
-
-            foreach (var type in sourceComponents)
-            {
-                if (!TryGetComponent(source, type, out var srcComp))
-                {
-                    allCopied = false;
-                    continue;
-                }
-
-                CopyComponent(source, target, srcComp, meta: meta);
-            }
-
-            return allCopied;
-        }
-
-        /// <inheritdoc/>
-        public IComponent CopyComponent(EntityUid source, EntityUid target, IComponent sourceComponent, MetaDataComponent? meta = null)
-        {
-            if (!MetaQuery.Resolve(target, ref meta))
-            {
-                throw new InvalidOperationException();
-            }
-
-            return CopyComponentInternal(source, target, sourceComponent, meta);
-        }
-
-        /// <inheritdoc/>
-        public T CopyComponent<T>(EntityUid source, EntityUid target, T sourceComponent,MetaDataComponent? meta = null) where T : IComponent
-        {
-            if (!MetaQuery.Resolve(target, ref meta))
-            {
-                throw new InvalidOperationException();
-            }
-
-            return CopyComponentInternal(source, target, sourceComponent, meta);
-        }
-
-        /// <inheritdoc/>
-        public void CopyComponents(EntityUid source, EntityUid target, MetaDataComponent? meta = null, params IComponent[] sourceComponents)
-        {
-            if (!MetaQuery.Resolve(target, ref meta))
-                return;
-
-            foreach (var comp in sourceComponents)
-            {
-                CopyComponentInternal(source, target, comp, meta);
-            }
-        }
-
-        private T CopyComponentInternal<T>(EntityUid source, EntityUid target, T sourceComponent, MetaDataComponent meta) where T : IComponent
-        {
-            var compReg = ComponentFactory.GetRegistration(sourceComponent.GetType());
-            var component = (T)ComponentFactory.GetComponent(compReg);
-
-            _serManager.CopyTo(sourceComponent, ref component, notNullableOverride: true);
-            component.Owner = target;
-
-            AddComponentInternal(target, component, compReg, true, false, meta);
-            return component;
-        }
-
-        public EntityQuery<TComp1> GetEntityQuery<TComp1>() where TComp1 : IComponent
-        {
-            var comps = _entTraitArray[CompIdx.ArrayIndex<TComp1>()];
-            DebugTools.Assert(comps != null, $"Unknown component: {typeof(TComp1).Name}");
-            return new EntityQuery<TComp1>(comps, _resolveSawmill);
-        }
-
-        public EntityQuery<IComponent> GetEntityQuery(Type type)
-        {
-            var comps = _entTraitDict[type];
-            DebugTools.Assert(comps != null, $"Unknown component: {type.Name}");
-            return new EntityQuery<IComponent>(comps, _resolveSawmill);
-        }
+        #region Entity-wide Component Access
 
         /// <inheritdoc />
         public IEnumerable<IComponent> GetComponents(EntityUid uid)
@@ -1217,7 +1258,7 @@ namespace Robust.Shared.GameObjects
 
         /// <summary>
         /// Copy the components for an entity into the given span,
-        /// or re-allocate the span as an array if there's not enough space.º
+        /// or re-allocate the span as an array if there's not enough space.
         /// </summary>
         private void CopyComponentsInto(ref Span<IComponent?> comps, EntityUid uid)
         {
@@ -1261,106 +1302,22 @@ namespace Robust.Shared.GameObjects
                 : null;
         }
 
-        #region Join Functions
+        #endregion
 
-        public (EntityUid Uid, T Component)[] AllComponents<T>() where T : IComponent
+        #region High-Performance Queries
+
+        public EntityQuery<TComp1> GetEntityQuery<TComp1>() where TComp1 : IComponent
         {
-            var query = AllEntityQueryEnumerator<T>();
-            var comps = new (EntityUid Uid, T Component)[Count<T>()];
-            var i = 0;
-
-            while (query.MoveNext(out var uid, out var comp))
-            {
-                comps[i] = (uid, comp);
-                i++;
-            }
-
-            // Count<T> includes "deleted" components that are not returned by MoveNext()
-            // This ensures that we dont return an array with empty/invalid entries
-            Array.Resize(ref comps, i);
-            return comps;
+            var comps = _entTraitArray[CompIdx.ArrayIndex<TComp1>()];
+            DebugTools.Assert(comps != null, $"Unknown component: {typeof(TComp1).Name}");
+            return new EntityQuery<TComp1>(comps, _resolveSawmill);
         }
 
-        public Entity<T>[] AllEntities<T>() where T : IComponent
+        public EntityQuery<IComponent> GetEntityQuery(Type type)
         {
-            var query = AllEntityQueryEnumerator<T>();
-            var comps = new Entity<T>[Count<T>()];
-            var i = 0;
-
-            while (query.MoveNext(out var uid, out var comp))
-            {
-                comps[i++] = (uid, comp);
-            }
-
-            // Count<T> includes "deleted" components that are not returned by MoveNext()
-            // This ensures that we dont return an array with empty/invalid entries
-            Array.Resize(ref comps, i);
-            return comps;
-        }
-
-        public Entity<IComponent>[] AllEntities(Type tComp)
-        {
-            var query = AllEntityQueryEnumerator(tComp);
-            var comps = new Entity<IComponent>[Count(tComp)];
-            var i = 0;
-
-            while (query.MoveNext(out var uid, out var comp))
-            {
-                comps[i++] = (uid, comp);
-            }
-
-            // Count() includes "deleted" components that are not returned by MoveNext()
-            // This ensures that we dont return an array with empty/invalid entries
-            Array.Resize(ref comps, i);
-            return comps;
-        }
-
-
-        public EntityUid[] AllEntityUids<T>() where T : IComponent
-        {
-            var query = AllEntityQueryEnumerator<T>();
-            var comps = new EntityUid[Count<T>()];
-            var i = 0;
-
-            while (query.MoveNext(out var uid, out _))
-            {
-                comps[i++] = uid;
-            }
-
-            // Count<T> includes "deleted" components that are not returned by MoveNext()
-            // This ensures that we dont return an array with empty/invalid entries
-            Array.Resize(ref comps, i);
-            return comps;
-        }
-
-        public EntityUid[] AllEntityUids(Type tComp)
-        {
-            var query = AllEntityQueryEnumerator(tComp);
-            var comps = new EntityUid[Count(tComp)];
-            var i = 0;
-
-            while (query.MoveNext(out var uid, out _))
-            {
-                comps[i++] = uid;
-            }
-
-            // Count() includes "deleted" components that are not returned by MoveNext()
-            // This ensures that we dont return an array with empty/invalid entries
-            Array.Resize(ref comps, i);
-            return comps;
-        }
-
-        public List<(EntityUid Uid, T Component)> AllComponentsList<T>() where T : IComponent
-        {
-            var query = AllEntityQueryEnumerator<T>();
-            var comps = new List<(EntityUid Uid, T Component)>(Count<T>());
-
-            while (query.MoveNext(out var uid, out var comp))
-            {
-                comps.Add((uid, comp));
-            }
-
-            return comps;
+            var comps = _entTraitDict[type];
+            DebugTools.Assert(comps != null, $"Unknown component: {type.Name}");
+            return new EntityQuery<IComponent>(comps, _resolveSawmill);
         }
 
         /// <inheritdoc />
@@ -1479,6 +1436,109 @@ namespace Robust.Shared.GameObjects
             return new EntityQueryEnumerator<TComp1, TComp2, TComp3, TComp4>(trait1, trait2, trait3, trait4, MetaQuery);
         }
 
+        #endregion
+
+        #region LINQ-style Queries & Collection Generators
+
+        public (EntityUid Uid, T Component)[] AllComponents<T>() where T : IComponent
+        {
+            var query = AllEntityQueryEnumerator<T>();
+            var comps = new (EntityUid Uid, T Component)[Count<T>()];
+            var i = 0;
+
+            while (query.MoveNext(out var uid, out var comp))
+            {
+                comps[i] = (uid, comp);
+                i++;
+            }
+
+            // Count<T> includes "deleted" components that are not returned by MoveNext()
+            // This ensures that we dont return an array with empty/invalid entries
+            Array.Resize(ref comps, i);
+            return comps;
+        }
+
+        public Entity<T>[] AllEntities<T>() where T : IComponent
+        {
+            var query = AllEntityQueryEnumerator<T>();
+            var comps = new Entity<T>[Count<T>()];
+            var i = 0;
+
+            while (query.MoveNext(out var uid, out var comp))
+            {
+                comps[i++] = (uid, comp);
+            }
+
+            // Count<T> includes "deleted" components that are not returned by MoveNext()
+            // This ensures that we dont return an array with empty/invalid entries
+            Array.Resize(ref comps, i);
+            return comps;
+        }
+
+        public Entity<IComponent>[] AllEntities(Type tComp)
+        {
+            var query = AllEntityQueryEnumerator(tComp);
+            var comps = new Entity<IComponent>[Count(tComp)];
+            var i = 0;
+
+            while (query.MoveNext(out var uid, out var comp))
+            {
+                comps[i++] = (uid, comp);
+            }
+
+            // Count() includes "deleted" components that are not returned by MoveNext()
+            // This ensures that we dont return an array with empty/invalid entries
+            Array.Resize(ref comps, i);
+            return comps;
+        }
+
+        public EntityUid[] AllEntityUids<T>() where T : IComponent
+        {
+            var query = AllEntityQueryEnumerator<T>();
+            var comps = new EntityUid[Count<T>()];
+            var i = 0;
+
+            while (query.MoveNext(out var uid, out _))
+            {
+                comps[i++] = uid;
+            }
+
+            // Count<T> includes "deleted" components that are not returned by MoveNext()
+            // This ensures that we dont return an array with empty/invalid entries
+            Array.Resize(ref comps, i);
+            return comps;
+        }
+
+        public EntityUid[] AllEntityUids(Type tComp)
+        {
+            var query = AllEntityQueryEnumerator(tComp);
+            var comps = new EntityUid[Count(tComp)];
+            var i = 0;
+
+            while (query.MoveNext(out var uid, out _))
+            {
+                comps[i++] = uid;
+            }
+
+            // Count() includes "deleted" components that are not returned by MoveNext()
+            // This ensures that we dont return an array with empty/invalid entries
+            Array.Resize(ref comps, i);
+            return comps;
+        }
+
+        public List<(EntityUid Uid, T Component)> AllComponentsList<T>() where T : IComponent
+        {
+            var query = AllEntityQueryEnumerator<T>();
+            var comps = new List<(EntityUid Uid, T Component)>(Count<T>());
+
+            while (query.MoveNext(out var uid, out var comp))
+            {
+                comps.Add((uid, comp));
+            }
+
+            return comps;
+        }
+
         /// <inheritdoc />
         public IEnumerable<T> EntityQuery<T>(bool includePaused = false) where T : IComponent
         {
@@ -1525,8 +1585,8 @@ namespace Robust.Shared.GameObjects
                         continue;
 
                     yield return (
-                        (TComp1) t1Comp,
-                        (TComp2) t2Comp);
+                        (TComp1)t1Comp,
+                        (TComp2)t2Comp);
                 }
             }
             else
@@ -1546,8 +1606,8 @@ namespace Robust.Shared.GameObjects
                     if (meta.EntityPaused) continue;
 
                     yield return (
-                        (TComp1) t1Comp,
-                        (TComp2) t2Comp);
+                        (TComp1)t1Comp,
+                        (TComp2)t2Comp);
                 }
             }
         }
@@ -1573,9 +1633,9 @@ namespace Robust.Shared.GameObjects
                         continue;
 
                     yield return (
-                        (TComp1) t1Comp,
-                        (TComp2) t2Comp,
-                        (TComp3) t3Comp);
+                        (TComp1)t1Comp,
+                        (TComp2)t2Comp,
+                        (TComp3)t3Comp);
                 }
             }
             else
@@ -1598,9 +1658,9 @@ namespace Robust.Shared.GameObjects
                     if (meta.EntityPaused) continue;
 
                     yield return (
-                        (TComp1) t1Comp,
-                        (TComp2) t2Comp,
-                        (TComp3) t3Comp);
+                        (TComp1)t1Comp,
+                        (TComp2)t2Comp,
+                        (TComp3)t3Comp);
                 }
             }
         }
@@ -1632,10 +1692,10 @@ namespace Robust.Shared.GameObjects
                         continue;
 
                     yield return (
-                        (TComp1) t1Comp,
-                        (TComp2) t2Comp,
-                        (TComp3) t3Comp,
-                        (TComp4) t4Comp);
+                        (TComp1)t1Comp,
+                        (TComp2)t2Comp,
+                        (TComp3)t3Comp,
+                        (TComp4)t4Comp);
                 }
             }
             else
@@ -1661,15 +1721,13 @@ namespace Robust.Shared.GameObjects
                     if (meta.EntityPaused) continue;
 
                     yield return (
-                        (TComp1) t1Comp,
-                        (TComp2) t2Comp,
-                        (TComp3) t3Comp,
-                        (TComp4) t4Comp);
+                        (TComp1)t1Comp,
+                        (TComp2)t2Comp,
+                        (TComp3)t3Comp,
+                        (TComp4)t4Comp);
                 }
             }
         }
-
-        #endregion
 
         /// <inheritdoc />
         public IEnumerable<(EntityUid Uid, IComponent Component)> GetAllComponents(Type type, bool includePaused = false)
@@ -1696,13 +1754,22 @@ namespace Robust.Shared.GameObjects
             }
         }
 
+        #endregion
+
+        #region Networking
+
         /// <inheritdoc />
         [Pure]
         public IComponentState? GetComponentState(IEventBus eventBus, IComponent component, ICommonSession? session, GameTick fromTick)
         {
             DebugTools.Assert(component.NetSyncEnabled, $"Attempting to get component state for an un-synced component: {component.GetType()}");
             var getState = new ComponentGetState(session, fromTick);
+
+            #pragma warning disable CS0618 // Owner is obsolete, but required to raise the event correctly.
             eventBus.RaiseComponentEvent(component.Owner, component, ref getState);
+            #pragma warning restore CS0618
+
+
 
             return getState.State;
         }
@@ -1710,986 +1777,1002 @@ namespace Robust.Shared.GameObjects
         public bool CanGetComponentState(IEventBus eventBus, IComponent component, ICommonSession player)
         {
             var attempt = new ComponentGetStateAttemptEvent(player);
+
+            #pragma warning disable CS0618 // Owner is obsolete, but required to raise the event correctly.
             eventBus.RaiseComponentEvent(component.Owner, component, ref attempt);
+            #pragma warning restore CS0618
+
+
             return !attempt.Cancelled;
         }
 
         #endregion
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void FillComponentDict()
+    // The closing brace for the EntityManager class
+}
+
+#region Helper Structs
+
+#region NetComponent Enumeration
+
+public readonly struct NetComponentEnumerable
+{
+    private readonly Dictionary<ushort, IComponent> _dictionary;
+
+    public NetComponentEnumerable(Dictionary<ushort, IComponent> dictionary) => _dictionary = dictionary;
+    public NetComponentEnumerator GetEnumerator() => new(_dictionary);
+}
+
+public struct NetComponentEnumerator
+{
+    // DO NOT MAKE THIS READONLY
+    private Dictionary<ushort, IComponent>.Enumerator _dictEnum;
+
+    public NetComponentEnumerator(Dictionary<ushort, IComponent> dictionary) =>
+        _dictEnum = dictionary.GetEnumerator();
+
+    public bool MoveNext() => _dictEnum.MoveNext();
+
+    public (ushort netId, IComponent component) Current
+    {
+        get
         {
-            _entTraitDict = FrozenDictionary<Type, Dictionary<EntityUid, IComponent>>.Empty;
-            Array.Fill(_entTraitArray, null);
-            RegisterComponents(_componentFactory.GetAllRegistrations());
+            var val = _dictEnum.Current;
+            return (val.Key, val.Value);
         }
     }
+}
 
-    public readonly struct NetComponentEnumerable
+#endregion
+
+#region EntityQuery<T>
+
+public readonly struct EntityQuery<TComp1> where TComp1 : IComponent
+{
+    private readonly Dictionary<EntityUid, IComponent> _traitDict;
+    private readonly ISawmill _sawmill;
+
+    public EntityQuery(Dictionary<EntityUid, IComponent> traitDict, ISawmill sawmill)
     {
-        private readonly Dictionary<ushort, IComponent> _dictionary;
-
-        public NetComponentEnumerable(Dictionary<ushort, IComponent> dictionary) => _dictionary = dictionary;
-        public NetComponentEnumerator GetEnumerator() => new(_dictionary);
+        _traitDict = traitDict;
+        _sawmill = sawmill;
     }
 
-    public struct NetComponentEnumerator
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [Pure]
+    public TComp1 GetComponent(EntityUid uid)
     {
-        // DO NOT MAKE THIS READONLY
-        private Dictionary<ushort, IComponent>.Enumerator _dictEnum;
+        if (_traitDict.TryGetValue(uid, out var comp) && !comp.Deleted)
+            return (TComp1) comp;
 
-        public NetComponentEnumerator(Dictionary<ushort, IComponent> dictionary) =>
-            _dictEnum = dictionary.GetEnumerator();
-
-        public bool MoveNext() => _dictEnum.MoveNext();
-
-        public (ushort netId, IComponent component) Current
-        {
-            get
-            {
-                var val = _dictEnum.Current;
-                return (val.Key, val.Value);
-            }
-        }
+        throw new KeyNotFoundException($"Entity {uid} does not have a component of type {typeof(TComp1)}");
     }
 
-    public readonly struct EntityQuery<TComp1> where TComp1 : IComponent
+    [MethodImpl(MethodImplOptions.AggressiveInlining), Pure]
+    public Entity<TComp1> Get(EntityUid uid)
     {
-        private readonly Dictionary<EntityUid, IComponent> _traitDict;
-        private readonly ISawmill _sawmill;
+        if (_traitDict.TryGetValue(uid, out var comp) && !comp.Deleted)
+            return new Entity<TComp1>(uid, (TComp1) comp);
 
-        public EntityQuery(Dictionary<EntityUid, IComponent> traitDict, ISawmill sawmill)
+        throw new KeyNotFoundException($"Entity {uid} does not have a component of type {typeof(TComp1)}");
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [Pure]
+    public bool TryGetComponent([NotNullWhen(true)] EntityUid? uid, [NotNullWhen(true)] out TComp1? component)
+    {
+        if (uid == null)
         {
-            _traitDict = traitDict;
-            _sawmill = sawmill;
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        [Pure]
-        public TComp1 GetComponent(EntityUid uid)
-        {
-            if (_traitDict.TryGetValue(uid, out var comp) && !comp.Deleted)
-                return (TComp1) comp;
-
-            throw new KeyNotFoundException($"Entity {uid} does not have a component of type {typeof(TComp1)}");
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining), Pure]
-        public Entity<TComp1> Get(EntityUid uid)
-        {
-            if (_traitDict.TryGetValue(uid, out var comp) && !comp.Deleted)
-                return new Entity<TComp1>(uid, (TComp1) comp);
-
-            throw new KeyNotFoundException($"Entity {uid} does not have a component of type {typeof(TComp1)}");
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        [Pure]
-        public bool TryGetComponent([NotNullWhen(true)] EntityUid? uid, [NotNullWhen(true)] out TComp1? component)
-        {
-            if (uid == null)
-            {
-                component = default;
-                return false;
-            }
-
-            return TryGetComponent(uid.Value, out component);
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        [Pure]
-        public bool TryGetComponent(EntityUid uid, [NotNullWhen(true)] out TComp1? component)
-        {
-            if (_traitDict.TryGetValue(uid, out var comp) && !comp.Deleted)
-            {
-                component = (TComp1) comp;
-                return true;
-            }
-
             component = default;
             return false;
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        [Pure]
-        public bool TryComp(EntityUid uid, [NotNullWhen(true)] out TComp1? component)
-            => TryGetComponent(uid, out component);
+        return TryGetComponent(uid.Value, out component);
+    }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        [Pure]
-        public bool TryComp([NotNullWhen(true)] EntityUid? uid, [NotNullWhen(true)] out TComp1? component)
-            => TryGetComponent(uid, out component);
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        [Pure]
-        public bool HasComp(EntityUid uid) => HasComponent(uid);
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        [Pure]
-        public bool HasComp([NotNullWhen(true)] EntityUid? uid) => HasComponent(uid);
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        [Pure]
-        public bool HasComponent(EntityUid uid)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [Pure]
+    public bool TryGetComponent(EntityUid uid, [NotNullWhen(true)] out TComp1? component)
+    {
+        if (_traitDict.TryGetValue(uid, out var comp) && !comp.Deleted)
         {
-            return _traitDict.TryGetValue(uid, out var comp) && !comp.Deleted;
+            component = (TComp1) comp;
+            return true;
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        [Pure]
-        public bool HasComponent([NotNullWhen(true)] EntityUid? uid)
+        component = default;
+        return false;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [Pure]
+    public bool TryComp(EntityUid uid, [NotNullWhen(true)] out TComp1? component)
+        => TryGetComponent(uid, out component);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [Pure]
+    public bool TryComp([NotNullWhen(true)] EntityUid? uid, [NotNullWhen(true)] out TComp1? component)
+        => TryGetComponent(uid, out component);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [Pure]
+    public bool HasComp(EntityUid uid) => HasComponent(uid);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [Pure]
+    public bool HasComp([NotNullWhen(true)] EntityUid? uid) => HasComponent(uid);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [Pure]
+    public bool HasComponent(EntityUid uid)
+    {
+        return _traitDict.TryGetValue(uid, out var comp) && !comp.Deleted;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [Pure]
+    public bool HasComponent([NotNullWhen(true)] EntityUid? uid)
+    {
+        return uid != null && HasComponent(uid.Value);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool Resolve(EntityUid uid, [NotNullWhen(true)] ref TComp1? component, bool logMissing = true)
+    {
+        if (component != null)
         {
-            return uid != null && HasComponent(uid.Value);
+            DebugTools.AssertOwner(uid, component);
+            return true;
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public bool Resolve(EntityUid uid, [NotNullWhen(true)] ref TComp1? component, bool logMissing = true)
+        if (_traitDict.TryGetValue(uid, out var comp) && !comp.Deleted)
         {
-            if (component != null)
-            {
-                DebugTools.AssertOwner(uid, component);
-                return true;
-            }
-
-            if (_traitDict.TryGetValue(uid, out var comp) && !comp.Deleted)
-            {
-                component = (TComp1)comp;
-                return true;
-            }
-
-            if (logMissing)
-            {
-                _sawmill.Error($"Can't resolve \"{typeof(TComp1)}\" on entity {uid}!\n{Environment.StackTrace}");
-            }
-
-            return false;
+            component = (TComp1)comp;
+            return true;
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public bool Resolve(ref Entity<TComp1?> entity, bool logMissing = true)
+        if (logMissing)
         {
-            return Resolve(entity.Owner, ref entity.Comp, logMissing);
+            _sawmill.Error($"Can't resolve \"{typeof(TComp1)}\" on entity {uid}!\n{Environment.StackTrace}");
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        [Pure]
-        public TComp1? CompOrNull(EntityUid uid)
+        return false;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool Resolve(ref Entity<TComp1?> entity, bool logMissing = true)
+    {
+        return Resolve(entity.Owner, ref entity.Comp, logMissing);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [Pure]
+    public TComp1? CompOrNull(EntityUid uid)
+    {
+        if (TryGetComponent(uid, out var comp))
+            return comp;
+
+        return default;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [Pure]
+    public TComp1 Comp(EntityUid uid)
+    {
+        return GetComponent(uid);
+    }
+
+    #region Internal Methods
+
+    /// <summary>
+    /// Elides the component.Deleted check of <see cref="GetComponent"/>
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [Pure]
+    internal TComp1 GetComponentInternal(EntityUid uid)
+    {
+        if (_traitDict.TryGetValue(uid, out var comp))
+            return (TComp1) comp;
+
+        throw new KeyNotFoundException($"Entity {uid} does not have a component of type {typeof(TComp1)}");
+    }
+
+    /// <summary>
+    /// Elides the component.Deleted check of <see cref="TryGetComponent(System.Nullable{Robust.Shared.GameObjects.EntityUid},out TComp1?)"/>
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [Pure]
+    internal bool TryGetComponentInternal([NotNullWhen(true)] EntityUid? uid, [NotNullWhen(true)] out TComp1? component)
+    {
+        if (uid == null)
         {
-            if (TryGetComponent(uid, out var comp))
-                return comp;
-
-            return default;
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        [Pure]
-        public TComp1 Comp(EntityUid uid)
-        {
-            return GetComponent(uid);
-        }
-
-        #region Internal
-
-        /// <summary>
-        /// Elides the component.Deleted check of <see cref="GetComponent"/>
-        /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        [Pure]
-        internal TComp1 GetComponentInternal(EntityUid uid)
-        {
-            if (_traitDict.TryGetValue(uid, out var comp))
-                return (TComp1) comp;
-
-            throw new KeyNotFoundException($"Entity {uid} does not have a component of type {typeof(TComp1)}");
-        }
-
-        /// <summary>
-        /// Elides the component.Deleted check of <see cref="TryGetComponent(System.Nullable{Robust.Shared.GameObjects.EntityUid},out TComp1?)"/>
-        /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        [Pure]
-        internal bool TryGetComponentInternal([NotNullWhen(true)] EntityUid? uid, [NotNullWhen(true)] out TComp1? component)
-        {
-            if (uid == null)
-            {
-                component = default;
-                return false;
-            }
-
-            return TryGetComponentInternal(uid.Value, out component);
-        }
-
-        /// <summary>
-        /// Elides the component.Deleted check of <see cref="TryGetComponent(System.Nullable{Robust.Shared.GameObjects.EntityUid},out TComp1?)"/>
-        /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        [Pure]
-        internal bool TryGetComponentInternal(EntityUid uid, [NotNullWhen(true)] out TComp1? component)
-        {
-            if (_traitDict.TryGetValue(uid, out var comp))
-            {
-                component = (TComp1) comp;
-                return true;
-            }
-
             component = default;
             return false;
         }
 
-        /// <summary>
-        /// Elides the component.Deleted check of <see cref="HasComponent(EntityUid)"/>
-        /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        [Pure]
-        internal bool HasComponentInternal(EntityUid uid)
-        {
-            return _traitDict.TryGetValue(uid, out var comp) && !comp.Deleted;
-        }
-
-        /// <summary>
-        /// Elides the component.Deleted check of <see cref="Resolve"/>
-        /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        [Pure]
-        internal bool ResolveInternal(EntityUid uid, [NotNullWhen(true)] ref TComp1? component, bool logMissing = true)
-        {
-            if (component != null)
-            {
-                DebugTools.AssertOwner(uid, component);
-                return true;
-            }
-
-            if (_traitDict.TryGetValue(uid, out var comp))
-            {
-                component = (TComp1)comp;
-                return true;
-            }
-
-            if (logMissing)
-                _sawmill.Error($"Can't resolve \"{typeof(TComp1)}\" on entity {uid}!\n{new StackTrace(1, true)}");
-
-            return false;
-        }
-        /// <summary>
-        /// Elides the component.Deleted check of <see cref="CompOrNull"/>
-        /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        [Pure]
-        internal TComp1? CompOrNullInternal(EntityUid uid)
-        {
-            if (TryGetComponent(uid, out var comp))
-                return comp;
-
-            return default;
-        }
-
-        #endregion
-    }
-
-    #region ComponentRegistry Query
-
-    /// <summary>
-    /// Returns entities that match the ComponentRegistry.
-    /// </summary>
-    public struct CompRegistryEntityEnumerator : IDisposable
-    {
-        private IEntityManager _entManager;
-
-        private Dictionary<EntityUid, IComponent>.Enumerator _traitDict;
-        private ComponentRegistry _registry;
-
-        public CompRegistryEntityEnumerator(
-            IEntityManager entManager,
-            Dictionary<EntityUid, IComponent> traitDict, ComponentRegistry registry)
-        {
-            _entManager = entManager;
-            _traitDict = traitDict.GetEnumerator();
-            _registry = registry;
-        }
-
-        public bool MoveNext(out EntityUid uid)
-        {
-            while (true)
-            {
-                if (!_traitDict.MoveNext())
-                {
-                    uid = default;
-                    return false;
-                }
-
-                var current = _traitDict.Current;
-
-                if (current.Value.Deleted)
-                {
-                    continue;
-                }
-
-                var idx = -1;
-                var found = true;
-
-                foreach (var comp in _registry)
-                {
-                    idx++;
-
-                    // First one is us
-                    if (idx == 0)
-                        continue;
-
-                    if (!_entManager.TryGetComponent(current.Key, comp.Value.Component.GetType(), out var nextComp) ||
-                        nextComp.Deleted)
-                    {
-                        found = false;
-                        break;
-                    }
-                }
-
-                if (!found)
-                    continue;
-
-                uid = current.Key;
-                return true;
-            }
-        }
-
-        public void Dispose()
-        {
-            _traitDict.Dispose();
-        }
+        return TryGetComponentInternal(uid.Value, out component);
     }
 
     /// <summary>
-    /// Non-generic version of <see cref="AllEntityQueryEnumerator{TComp1}"/>
+    /// Elides the component.Deleted check of <see cref="TryGetComponent(System.Nullable{Robust.Shared.GameObjects.EntityUid},out TComp1?)"/>
     /// </summary>
-    public struct ComponentQueryEnumerator : IDisposable
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [Pure]
+    internal bool TryGetComponentInternal(EntityUid uid, [NotNullWhen(true)] out TComp1? component)
     {
-        private Dictionary<EntityUid, IComponent>.Enumerator _traitDict;
-
-        public ComponentQueryEnumerator(
-            Dictionary<EntityUid, IComponent> traitDict)
+        if (_traitDict.TryGetValue(uid, out var comp))
         {
-            _traitDict = traitDict.GetEnumerator();
+            component = (TComp1) comp;
+            return true;
         }
 
-        public bool MoveNext(out EntityUid uid, [NotNullWhen(true)] out IComponent? comp1)
-        {
-            while (true)
-            {
-                if (!_traitDict.MoveNext())
-                {
-                    uid = default;
-                    comp1 = default;
-                    return false;
-                }
-
-                var current = _traitDict.Current;
-
-                if (current.Value.Deleted)
-                {
-                    continue;
-                }
-
-                uid = current.Key;
-                comp1 = current.Value;
-                return true;
-            }
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public bool MoveNext([NotNullWhen(true)] out IComponent? comp1)
-        {
-            return MoveNext(out _, out comp1);
-        }
-
-        public void Dispose()
-        {
-            _traitDict.Dispose();
-        }
-    }
-    #endregion
-
-    #region Query
-
-    /// <summary>
-    /// Returns all matching unpaused components.
-    /// </summary>
-    public struct EntityQueryEnumerator<TComp1> : IDisposable
-        where TComp1 : IComponent
-    {
-        private Dictionary<EntityUid, IComponent>.Enumerator _traitDict;
-        private readonly EntityQuery<MetaDataComponent> _metaQuery;
-
-        public EntityQueryEnumerator(
-            Dictionary<EntityUid, IComponent> traitDict,
-            EntityQuery<MetaDataComponent> metaQuery)
-        {
-            _traitDict = traitDict.GetEnumerator();
-            _metaQuery = metaQuery;
-        }
-
-        public bool MoveNext(out EntityUid uid, [NotNullWhen(true)] out TComp1? comp1)
-        {
-            while (true)
-            {
-                if (!_traitDict.MoveNext())
-                {
-                    uid = default;
-                    comp1 = default;
-                    return false;
-                }
-
-                var current = _traitDict.Current;
-
-                if (current.Value.Deleted)
-                {
-                    continue;
-                }
-
-                if (!_metaQuery.TryGetComponentInternal(current.Key, out var metaComp) || metaComp.EntityPaused)
-                {
-                    continue;
-                }
-
-                uid = current.Key;
-                comp1 = (TComp1)current.Value;
-                return true;
-            }
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public bool MoveNext([NotNullWhen(true)] out TComp1? comp1)
-        {
-            return MoveNext(out _, out comp1);
-        }
-
-        public void Dispose()
-        {
-            _traitDict.Dispose();
-        }
+        component = default;
+        return false;
     }
 
     /// <summary>
-    /// Returns all matching unpaused components.
+    /// Elides the component.Deleted check of <see cref="HasComponent(EntityUid)"/>
     /// </summary>
-    public struct EntityQueryEnumerator<TComp1, TComp2> : IDisposable
-        where TComp1 : IComponent
-        where TComp2 : IComponent
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [Pure]
+    internal bool HasComponentInternal(EntityUid uid)
     {
-        private Dictionary<EntityUid, IComponent>.Enumerator _traitDict;
-        private readonly Dictionary<EntityUid, IComponent> _traitDict2;
-        private readonly EntityQuery<MetaDataComponent> _metaQuery;
-
-        public EntityQueryEnumerator(
-            Dictionary<EntityUid, IComponent> traitDict,
-            Dictionary<EntityUid, IComponent> traitDict2,
-            EntityQuery<MetaDataComponent> metaQuery)
-        {
-            _traitDict = traitDict.GetEnumerator();
-            _traitDict2 = traitDict2;
-            _metaQuery = metaQuery;
-        }
-
-        public bool MoveNext(out EntityUid uid, [NotNullWhen(true)] out TComp1? comp1, [NotNullWhen(true)] out TComp2? comp2)
-        {
-            while (true)
-            {
-                if (!_traitDict.MoveNext())
-                {
-                    uid = default;
-                    comp1 = default;
-                    comp2 = default;
-                    return false;
-                }
-
-                var current = _traitDict.Current;
-
-                if (current.Value.Deleted)
-                {
-                    continue;
-                }
-
-                if (!_metaQuery.TryGetComponentInternal(current.Key, out var metaComp) || metaComp.EntityPaused)
-                {
-                    continue;
-                }
-
-                if (!_traitDict2.TryGetValue(current.Key, out var comp2Obj) || comp2Obj.Deleted)
-                {
-                    continue;
-                }
-
-                uid = current.Key;
-                comp1 = (TComp1)current.Value;
-                comp2 = (TComp2)comp2Obj;
-                return true;
-            }
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public bool MoveNext([NotNullWhen(true)] out TComp1? comp1, [NotNullWhen(true)] out TComp2? comp2)
-        {
-            return MoveNext(out _, out comp1, out comp2);
-        }
-
-        public void Dispose()
-        {
-            _traitDict.Dispose();
-        }
+        return _traitDict.TryGetValue(uid, out var comp) && !comp.Deleted;
     }
 
     /// <summary>
-    /// Returns all matching unpaused components.
+    /// Elides the component.Deleted check of <see cref="Resolve"/>
     /// </summary>
-    public struct EntityQueryEnumerator<TComp1, TComp2, TComp3> : IDisposable
-        where TComp1 : IComponent
-        where TComp2 : IComponent
-        where TComp3 : IComponent
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [Pure]
+    internal bool ResolveInternal(EntityUid uid, [NotNullWhen(true)] ref TComp1? component, bool logMissing = true)
     {
-        private Dictionary<EntityUid, IComponent>.Enumerator _traitDict;
-        private readonly Dictionary<EntityUid, IComponent> _traitDict2;
-        private readonly Dictionary<EntityUid, IComponent> _traitDict3;
-        private readonly EntityQuery<MetaDataComponent> _metaQuery;
-
-        public EntityQueryEnumerator(
-            Dictionary<EntityUid, IComponent> traitDict,
-            Dictionary<EntityUid, IComponent> traitDict2,
-            Dictionary<EntityUid, IComponent> traitDict3,
-            EntityQuery<MetaDataComponent> metaQuery)
+        if (component != null)
         {
-            _traitDict = traitDict.GetEnumerator();
-            _traitDict2 = traitDict2;
-            _traitDict3 = traitDict3;
-            _metaQuery = metaQuery;
+            DebugTools.AssertOwner(uid, component);
+            return true;
         }
 
-        public bool MoveNext(out EntityUid uid, [NotNullWhen(true)] out TComp1? comp1, [NotNullWhen(true)] out TComp2? comp2, [NotNullWhen(true)] out TComp3? comp3)
+        if (_traitDict.TryGetValue(uid, out var comp))
         {
-            while (true)
-            {
-                if (!_traitDict.MoveNext())
-                {
-                    uid = default;
-                    comp1 = default;
-                    comp2 = default;
-                    comp3 = default;
-                    return false;
-                }
-
-                var current = _traitDict.Current;
-
-                if (current.Value.Deleted)
-                {
-                    continue;
-                }
-
-                if (!_metaQuery.TryGetComponentInternal(current.Key, out var metaComp) || metaComp.EntityPaused)
-                {
-                    continue;
-                }
-
-                if (!_traitDict2.TryGetValue(current.Key, out var comp2Obj) || comp2Obj.Deleted)
-                {
-                    continue;
-                }
-
-                if (!_traitDict3.TryGetValue(current.Key, out var comp3Obj) || comp3Obj.Deleted)
-                {
-                    continue;
-                }
-
-                uid = current.Key;
-                comp1 = (TComp1)current.Value;
-                comp2 = (TComp2)comp2Obj;
-                comp3 = (TComp3)comp3Obj;
-                return true;
-            }
+            component = (TComp1)comp;
+            return true;
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public bool MoveNext(
-            [NotNullWhen(true)] out TComp1? comp1,
-            [NotNullWhen(true)] out TComp2? comp2,
-            [NotNullWhen(true)] out TComp3? comp3)
-        {
-            return MoveNext(out _, out comp1, out comp2, out comp3);
-        }
+        if (logMissing)
+            _sawmill.Error($"Can't resolve \"{typeof(TComp1)}\" on entity {uid}!\n{new StackTrace(1, true)}");
 
-        public void Dispose()
-        {
-            _traitDict.Dispose();
-        }
+        return false;
     }
-
     /// <summary>
-    /// Returns all matching unpaused components.
+    /// Elides the component.Deleted check of <see cref="CompOrNull"/>
     /// </summary>
-    public struct EntityQueryEnumerator<TComp1, TComp2, TComp3, TComp4> : IDisposable
-        where TComp1 : IComponent
-        where TComp2 : IComponent
-        where TComp3 : IComponent
-        where TComp4 : IComponent
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [Pure]
+    internal TComp1? CompOrNullInternal(EntityUid uid)
     {
-        private Dictionary<EntityUid, IComponent>.Enumerator _traitDict;
-        private readonly Dictionary<EntityUid, IComponent> _traitDict2;
-        private readonly Dictionary<EntityUid, IComponent> _traitDict3;
-        private readonly Dictionary<EntityUid, IComponent> _traitDict4;
-        private readonly EntityQuery<MetaDataComponent> _metaQuery;
+        if (TryGetComponent(uid, out var comp))
+            return comp;
 
-        public EntityQueryEnumerator(
-            Dictionary<EntityUid, IComponent> traitDict,
-            Dictionary<EntityUid, IComponent> traitDict2,
-            Dictionary<EntityUid, IComponent> traitDict3,
-            Dictionary<EntityUid, IComponent> traitDict4,
-            EntityQuery<MetaDataComponent> metaQuery)
-        {
-            _traitDict = traitDict.GetEnumerator();
-            _traitDict2 = traitDict2;
-            _traitDict3 = traitDict3;
-            _traitDict4 = traitDict4;
-            _metaQuery = metaQuery;
-        }
-
-        public bool MoveNext(out EntityUid uid, [NotNullWhen(true)] out TComp1? comp1, [NotNullWhen(true)] out TComp2? comp2, [NotNullWhen(true)] out TComp3? comp3, [NotNullWhen(true)] out TComp4? comp4)
-        {
-            while (true)
-            {
-                if (!_traitDict.MoveNext())
-                {
-                    uid = default;
-                    comp1 = default;
-                    comp2 = default;
-                    comp3 = default;
-                    comp4 = default;
-                    return false;
-                }
-
-                var current = _traitDict.Current;
-
-                if (current.Value.Deleted)
-                {
-                    continue;
-                }
-
-                if (!_metaQuery.TryGetComponentInternal(current.Key, out var metaComp) || metaComp.EntityPaused)
-                {
-                    continue;
-                }
-
-                if (!_traitDict2.TryGetValue(current.Key, out var comp2Obj) || comp2Obj.Deleted)
-                {
-                    continue;
-                }
-
-                if (!_traitDict3.TryGetValue(current.Key, out var comp3Obj) || comp3Obj.Deleted)
-                {
-                    continue;
-                }
-
-                if (!_traitDict4.TryGetValue(current.Key, out var comp4Obj) || comp4Obj.Deleted)
-                {
-                    continue;
-                }
-
-                uid = current.Key;
-                comp1 = (TComp1)current.Value;
-                comp2 = (TComp2)comp2Obj;
-                comp3 = (TComp3)comp3Obj;
-                comp4 = (TComp4)comp4Obj;
-                return true;
-            }
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public bool MoveNext(
-            [NotNullWhen(true)] out TComp1? comp1,
-            [NotNullWhen(true)] out TComp2? comp2,
-            [NotNullWhen(true)] out TComp3? comp3,
-            [NotNullWhen(true)] out TComp4? comp4)
-        {
-            return MoveNext(out _, out comp1, out comp2, out comp3, out comp4);
-        }
-
-        public void Dispose()
-        {
-            _traitDict.Dispose();
-        }
-    }
-
-    #endregion
-
-    #region All query
-
-    /// <summary>
-    /// Returns all matching components, paused or not.
-    /// </summary>
-    public struct AllEntityQueryEnumerator<TComp1> : IDisposable
-        where TComp1 : IComponent
-    {
-        private Dictionary<EntityUid, IComponent>.Enumerator _traitDict;
-
-        public AllEntityQueryEnumerator(
-            Dictionary<EntityUid, IComponent> traitDict)
-        {
-            _traitDict = traitDict.GetEnumerator();
-        }
-
-        public bool MoveNext(out EntityUid uid, [NotNullWhen(true)] out TComp1? comp1)
-        {
-            while (true)
-            {
-                if (!_traitDict.MoveNext())
-                {
-                    uid = default;
-                    comp1 = default;
-                    return false;
-                }
-
-                var current = _traitDict.Current;
-
-                if (current.Value.Deleted)
-                {
-                    continue;
-                }
-
-                uid = current.Key;
-                comp1 = (TComp1)current.Value;
-                return true;
-            }
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public bool MoveNext([NotNullWhen(true)] out TComp1? comp1)
-        {
-            return MoveNext(out _, out comp1);
-        }
-
-        public void Dispose()
-        {
-            _traitDict.Dispose();
-        }
-    }
-
-    /// <summary>
-    /// Returns all matching components, paused or not.
-    /// </summary>
-    public struct AllEntityQueryEnumerator<TComp1, TComp2> : IDisposable
-        where TComp1 : IComponent
-        where TComp2 : IComponent
-    {
-        private Dictionary<EntityUid, IComponent>.Enumerator _traitDict;
-        private readonly Dictionary<EntityUid, IComponent> _traitDict2;
-
-        public AllEntityQueryEnumerator(
-            Dictionary<EntityUid, IComponent> traitDict,
-            Dictionary<EntityUid, IComponent> traitDict2)
-        {
-            _traitDict = traitDict.GetEnumerator();
-            _traitDict2 = traitDict2;
-        }
-
-        public bool MoveNext(out EntityUid uid, [NotNullWhen(true)] out TComp1? comp1, [NotNullWhen(true)] out TComp2? comp2)
-        {
-            while (true)
-            {
-                if (!_traitDict.MoveNext())
-                {
-                    uid = default;
-                    comp1 = default;
-                    comp2 = default;
-                    return false;
-                }
-
-                var current = _traitDict.Current;
-
-                if (current.Value.Deleted)
-                {
-                    continue;
-                }
-
-                if (!_traitDict2.TryGetValue(current.Key, out var comp2Obj) || comp2Obj.Deleted)
-                {
-                    continue;
-                }
-
-                uid = current.Key;
-                comp1 = (TComp1)current.Value;
-                comp2 = (TComp2)comp2Obj;
-                return true;
-            }
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public bool MoveNext([NotNullWhen(true)] out TComp1? comp1, [NotNullWhen(true)] out TComp2? comp2)
-        {
-            return MoveNext(out _, out comp1, out comp2);
-        }
-
-        public void Dispose()
-        {
-            _traitDict.Dispose();
-        }
-    }
-
-    /// <summary>
-    /// Returns all matching components, paused or not.
-    /// </summary>
-    public struct AllEntityQueryEnumerator<TComp1, TComp2, TComp3> : IDisposable
-        where TComp1 : IComponent
-        where TComp2 : IComponent
-        where TComp3 : IComponent
-    {
-        private Dictionary<EntityUid, IComponent>.Enumerator _traitDict;
-        private readonly Dictionary<EntityUid, IComponent> _traitDict2;
-        private readonly Dictionary<EntityUid, IComponent> _traitDict3;
-
-        public AllEntityQueryEnumerator(
-            Dictionary<EntityUid, IComponent> traitDict,
-            Dictionary<EntityUid, IComponent> traitDict2,
-            Dictionary<EntityUid, IComponent> traitDict3)
-        {
-            _traitDict = traitDict.GetEnumerator();
-            _traitDict2 = traitDict2;
-            _traitDict3 = traitDict3;
-        }
-
-        public bool MoveNext(out EntityUid uid, [NotNullWhen(true)] out TComp1? comp1, [NotNullWhen(true)] out TComp2? comp2, [NotNullWhen(true)] out TComp3? comp3)
-        {
-            while (true)
-            {
-                if (!_traitDict.MoveNext())
-                {
-                    uid = default;
-                    comp1 = default;
-                    comp2 = default;
-                    comp3 = default;
-                    return false;
-                }
-
-                var current = _traitDict.Current;
-
-                if (current.Value.Deleted)
-                {
-                    continue;
-                }
-
-                if (!_traitDict2.TryGetValue(current.Key, out var comp2Obj) || comp2Obj.Deleted)
-                {
-                    continue;
-                }
-
-                if (!_traitDict3.TryGetValue(current.Key, out var comp3Obj) || comp3Obj.Deleted)
-                {
-                    continue;
-                }
-
-                uid = current.Key;
-                comp1 = (TComp1)current.Value;
-                comp2 = (TComp2)comp2Obj;
-                comp3 = (TComp3)comp3Obj;
-                return true;
-            }
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public bool MoveNext(
-            [NotNullWhen(true)] out TComp1? comp1,
-            [NotNullWhen(true)] out TComp2? comp2,
-            [NotNullWhen(true)] out TComp3? comp3)
-        {
-            return MoveNext(out _, out comp1, out comp2, out comp3);
-        }
-
-        public void Dispose()
-        {
-            _traitDict.Dispose();
-        }
-    }
-
-    /// <summary>
-    /// Returns all matching components, paused or not.
-    /// </summary>
-    public struct AllEntityQueryEnumerator<TComp1, TComp2, TComp3, TComp4> : IDisposable
-        where TComp1 : IComponent
-        where TComp2 : IComponent
-        where TComp3 : IComponent
-        where TComp4 : IComponent
-    {
-        private Dictionary<EntityUid, IComponent>.Enumerator _traitDict;
-        private readonly Dictionary<EntityUid, IComponent> _traitDict2;
-        private readonly Dictionary<EntityUid, IComponent> _traitDict3;
-        private readonly Dictionary<EntityUid, IComponent> _traitDict4;
-
-        public AllEntityQueryEnumerator(
-            Dictionary<EntityUid, IComponent> traitDict,
-            Dictionary<EntityUid, IComponent> traitDict2,
-            Dictionary<EntityUid, IComponent> traitDict3,
-            Dictionary<EntityUid, IComponent> traitDict4)
-        {
-            _traitDict = traitDict.GetEnumerator();
-            _traitDict2 = traitDict2;
-            _traitDict3 = traitDict3;
-            _traitDict4 = traitDict4;
-        }
-
-        public bool MoveNext(out EntityUid uid, [NotNullWhen(true)] out TComp1? comp1, [NotNullWhen(true)] out TComp2? comp2, [NotNullWhen(true)] out TComp3? comp3, [NotNullWhen(true)] out TComp4? comp4)
-        {
-            while (true)
-            {
-                if (!_traitDict.MoveNext())
-                {
-                    uid = default;
-                    comp1 = default;
-                    comp2 = default;
-                    comp3 = default;
-                    comp4 = default;
-                    return false;
-                }
-
-                var current = _traitDict.Current;
-
-                if (current.Value.Deleted)
-                {
-                    continue;
-                }
-
-                if (!_traitDict2.TryGetValue(current.Key, out var comp2Obj) || comp2Obj.Deleted)
-                {
-                    continue;
-                }
-
-                if (!_traitDict3.TryGetValue(current.Key, out var comp3Obj) || comp3Obj.Deleted)
-                {
-                    continue;
-                }
-
-                if (!_traitDict4.TryGetValue(current.Key, out var comp4Obj) || comp4Obj.Deleted)
-                {
-                    continue;
-                }
-
-                uid = current.Key;
-                comp1 = (TComp1)current.Value;
-                comp2 = (TComp2)comp2Obj;
-                comp3 = (TComp3)comp3Obj;
-                comp4 = (TComp4)comp4Obj;
-                return true;
-            }
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public bool MoveNext(
-            [NotNullWhen(true)] out TComp1? comp1,
-            [NotNullWhen(true)] out TComp2? comp2,
-            [NotNullWhen(true)] out TComp3? comp3,
-            [NotNullWhen(true)] out TComp4? comp4)
-        {
-            return MoveNext(out _, out comp1, out comp2, out comp3, out comp4);
-        }
-
-        public void Dispose()
-        {
-            _traitDict.Dispose();
-        }
+        return default;
     }
 
     #endregion
 }
+
+#endregion
+
+#region Component Registry Enumerators
+
+/// <summary>
+/// Returns entities that match the ComponentRegistry.
+/// </summary>
+public struct CompRegistryEntityEnumerator : IDisposable
+{
+    private IEntityManager _entManager;
+
+    private Dictionary<EntityUid, IComponent>.Enumerator _traitDict;
+    private ComponentRegistry _registry;
+
+    public CompRegistryEntityEnumerator(
+        IEntityManager entManager,
+        Dictionary<EntityUid, IComponent> traitDict, ComponentRegistry registry)
+    {
+        _entManager = entManager;
+        _traitDict = traitDict.GetEnumerator();
+        _registry = registry;
+    }
+
+    public bool MoveNext(out EntityUid uid)
+    {
+        while (true)
+        {
+            if (!_traitDict.MoveNext())
+            {
+                uid = default;
+                return false;
+            }
+
+            var current = _traitDict.Current;
+
+            if (current.Value.Deleted)
+            {
+                continue;
+            }
+
+            var idx = -1;
+            var found = true;
+
+            foreach (var comp in _registry)
+            {
+                idx++;
+
+                // First one is us
+                if (idx == 0)
+                    continue;
+
+                if (!_entManager.TryGetComponent(current.Key, comp.Value.Component.GetType(), out var nextComp) ||
+                    nextComp.Deleted)
+                {
+                    found = false;
+                    break;
+                }
+            }
+
+            if (!found)
+                continue;
+
+            uid = current.Key;
+            return true;
+        }
+    }
+
+    public void Dispose()
+    {
+        _traitDict.Dispose();
+    }
+}
+
+/// <summary>
+/// Non-generic version of <see cref="AllEntityQueryEnumerator{TComp1}"/>
+/// </summary>
+public struct ComponentQueryEnumerator : IDisposable
+{
+    private Dictionary<EntityUid, IComponent>.Enumerator _traitDict;
+
+    public ComponentQueryEnumerator(
+        Dictionary<EntityUid, IComponent> traitDict)
+    {
+        _traitDict = traitDict.GetEnumerator();
+    }
+
+    public bool MoveNext(out EntityUid uid, [NotNullWhen(true)] out IComponent? comp1)
+    {
+        while (true)
+        {
+            if (!_traitDict.MoveNext())
+            {
+                uid = default;
+                comp1 = default;
+                return false;
+            }
+
+            var current = _traitDict.Current;
+
+            if (current.Value.Deleted)
+            {
+                continue;
+            }
+
+            uid = current.Key;
+            comp1 = current.Value;
+            return true;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool MoveNext([NotNullWhen(true)] out IComponent? comp1)
+    {
+        return MoveNext(out _, out comp1);
+    }
+
+    public void Dispose()
+    {
+        _traitDict.Dispose();
+    }
+}
+
+#endregion
+
+#region Unpaused Entity Query Enumerators
+
+/// <summary>
+/// Returns all matching unpaused components.
+/// </summary>
+public struct EntityQueryEnumerator<TComp1> : IDisposable
+    where TComp1 : IComponent
+{
+    private Dictionary<EntityUid, IComponent>.Enumerator _traitDict;
+    private readonly EntityQuery<MetaDataComponent> _metaQuery;
+
+    public EntityQueryEnumerator(
+        Dictionary<EntityUid, IComponent> traitDict,
+        EntityQuery<MetaDataComponent> metaQuery)
+    {
+        _traitDict = traitDict.GetEnumerator();
+        _metaQuery = metaQuery;
+    }
+
+    public bool MoveNext(out EntityUid uid, [NotNullWhen(true)] out TComp1? comp1)
+    {
+        while (true)
+        {
+            if (!_traitDict.MoveNext())
+            {
+                uid = default;
+                comp1 = default;
+                return false;
+            }
+
+            var current = _traitDict.Current;
+
+            if (current.Value.Deleted)
+            {
+                continue;
+            }
+
+            if (!_metaQuery.TryGetComponentInternal(current.Key, out var metaComp) || metaComp.EntityPaused)
+            {
+                continue;
+            }
+
+            uid = current.Key;
+            comp1 = (TComp1)current.Value;
+            return true;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool MoveNext([NotNullWhen(true)] out TComp1? comp1)
+    {
+        return MoveNext(out _, out comp1);
+    }
+
+    public void Dispose()
+    {
+        _traitDict.Dispose();
+    }
+}
+
+/// <summary>
+/// Returns all matching unpaused components.
+/// </summary>
+public struct EntityQueryEnumerator<TComp1, TComp2> : IDisposable
+    where TComp1 : IComponent
+    where TComp2 : IComponent
+{
+    private Dictionary<EntityUid, IComponent>.Enumerator _traitDict;
+    private readonly Dictionary<EntityUid, IComponent> _traitDict2;
+    private readonly EntityQuery<MetaDataComponent> _metaQuery;
+
+    public EntityQueryEnumerator(
+        Dictionary<EntityUid, IComponent> traitDict,
+        Dictionary<EntityUid, IComponent> traitDict2,
+        EntityQuery<MetaDataComponent> metaQuery)
+    {
+        _traitDict = traitDict.GetEnumerator();
+        _traitDict2 = traitDict2;
+        _metaQuery = metaQuery;
+    }
+
+    public bool MoveNext(out EntityUid uid, [NotNullWhen(true)] out TComp1? comp1, [NotNullWhen(true)] out TComp2? comp2)
+    {
+        while (true)
+        {
+            if (!_traitDict.MoveNext())
+            {
+                uid = default;
+                comp1 = default;
+                comp2 = default;
+                return false;
+            }
+
+            var current = _traitDict.Current;
+
+            if (current.Value.Deleted)
+            {
+                continue;
+            }
+
+            if (!_metaQuery.TryGetComponentInternal(current.Key, out var metaComp) || metaComp.EntityPaused)
+            {
+                continue;
+            }
+
+            if (!_traitDict2.TryGetValue(current.Key, out var comp2Obj) || comp2Obj.Deleted)
+            {
+                continue;
+            }
+
+            uid = current.Key;
+            comp1 = (TComp1)current.Value;
+            comp2 = (TComp2)comp2Obj;
+            return true;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool MoveNext([NotNullWhen(true)] out TComp1? comp1, [NotNullWhen(true)] out TComp2? comp2)
+    {
+        return MoveNext(out _, out comp1, out comp2);
+    }
+
+    public void Dispose()
+    {
+        _traitDict.Dispose();
+    }
+}
+
+/// <summary>
+/// Returns all matching unpaused components.
+/// </summary>
+public struct EntityQueryEnumerator<TComp1, TComp2, TComp3> : IDisposable
+    where TComp1 : IComponent
+    where TComp2 : IComponent
+    where TComp3 : IComponent
+{
+    private Dictionary<EntityUid, IComponent>.Enumerator _traitDict;
+    private readonly Dictionary<EntityUid, IComponent> _traitDict2;
+    private readonly Dictionary<EntityUid, IComponent> _traitDict3;
+    private readonly EntityQuery<MetaDataComponent> _metaQuery;
+
+    public EntityQueryEnumerator(
+        Dictionary<EntityUid, IComponent> traitDict,
+        Dictionary<EntityUid, IComponent> traitDict2,
+        Dictionary<EntityUid, IComponent> traitDict3,
+        EntityQuery<MetaDataComponent> metaQuery)
+    {
+        _traitDict = traitDict.GetEnumerator();
+        _traitDict2 = traitDict2;
+        _traitDict3 = traitDict3;
+        _metaQuery = metaQuery;
+    }
+
+    public bool MoveNext(out EntityUid uid, [NotNullWhen(true)] out TComp1? comp1, [NotNullWhen(true)] out TComp2? comp2, [NotNullWhen(true)] out TComp3? comp3)
+    {
+        while (true)
+        {
+            if (!_traitDict.MoveNext())
+            {
+                uid = default;
+                comp1 = default;
+                comp2 = default;
+                comp3 = default;
+                return false;
+            }
+
+            var current = _traitDict.Current;
+
+            if (current.Value.Deleted)
+            {
+                continue;
+            }
+
+            if (!_metaQuery.TryGetComponentInternal(current.Key, out var metaComp) || metaComp.EntityPaused)
+            {
+                continue;
+            }
+
+            if (!_traitDict2.TryGetValue(current.Key, out var comp2Obj) || comp2Obj.Deleted)
+            {
+                continue;
+            }
+
+            if (!_traitDict3.TryGetValue(current.Key, out var comp3Obj) || comp3Obj.Deleted)
+            {
+                continue;
+            }
+
+            uid = current.Key;
+            comp1 = (TComp1)current.Value;
+            comp2 = (TComp2)comp2Obj;
+            comp3 = (TComp3)comp3Obj;
+            return true;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool MoveNext(
+        [NotNullWhen(true)] out TComp1? comp1,
+        [NotNullWhen(true)] out TComp2? comp2,
+        [NotNullWhen(true)] out TComp3? comp3)
+    {
+        return MoveNext(out _, out comp1, out comp2, out comp3);
+    }
+
+    public void Dispose()
+    {
+        _traitDict.Dispose();
+    }
+}
+
+/// <summary>
+/// Returns all matching unpaused components.
+/// </summary>
+public struct EntityQueryEnumerator<TComp1, TComp2, TComp3, TComp4> : IDisposable
+    where TComp1 : IComponent
+    where TComp2 : IComponent
+    where TComp3 : IComponent
+    where TComp4 : IComponent
+{
+    private Dictionary<EntityUid, IComponent>.Enumerator _traitDict;
+    private readonly Dictionary<EntityUid, IComponent> _traitDict2;
+    private readonly Dictionary<EntityUid, IComponent> _traitDict3;
+    private readonly Dictionary<EntityUid, IComponent> _traitDict4;
+    private readonly EntityQuery<MetaDataComponent> _metaQuery;
+
+    public EntityQueryEnumerator(
+        Dictionary<EntityUid, IComponent> traitDict,
+        Dictionary<EntityUid, IComponent> traitDict2,
+        Dictionary<EntityUid, IComponent> traitDict3,
+        Dictionary<EntityUid, IComponent> traitDict4,
+        EntityQuery<MetaDataComponent> metaQuery)
+    {
+        _traitDict = traitDict.GetEnumerator();
+        _traitDict2 = traitDict2;
+        _traitDict3 = traitDict3;
+        _traitDict4 = traitDict4;
+        _metaQuery = metaQuery;
+    }
+
+    public bool MoveNext(out EntityUid uid, [NotNullWhen(true)] out TComp1? comp1, [NotNullWhen(true)] out TComp2? comp2, [NotNullWhen(true)] out TComp3? comp3, [NotNullWhen(true)] out TComp4? comp4)
+    {
+        while (true)
+        {
+            if (!_traitDict.MoveNext())
+            {
+                uid = default;
+                comp1 = default;
+                comp2 = default;
+                comp3 = default;
+                comp4 = default;
+                return false;
+            }
+
+            var current = _traitDict.Current;
+
+            if (current.Value.Deleted)
+            {
+                continue;
+            }
+
+            if (!_metaQuery.TryGetComponentInternal(current.Key, out var metaComp) || metaComp.EntityPaused)
+            {
+                continue;
+            }
+
+            if (!_traitDict2.TryGetValue(current.Key, out var comp2Obj) || comp2Obj.Deleted)
+            {
+                continue;
+            }
+
+            if (!_traitDict3.TryGetValue(current.Key, out var comp3Obj) || comp3Obj.Deleted)
+            {
+                continue;
+            }
+
+            if (!_traitDict4.TryGetValue(current.Key, out var comp4Obj) || comp4Obj.Deleted)
+            {
+                continue;
+            }
+
+            uid = current.Key;
+            comp1 = (TComp1)current.Value;
+            comp2 = (TComp2)comp2Obj;
+            comp3 = (TComp3)comp3Obj;
+            comp4 = (TComp4)comp4Obj;
+            return true;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool MoveNext(
+        [NotNullWhen(true)] out TComp1? comp1,
+        [NotNullWhen(true)] out TComp2? comp2,
+        [NotNullWhen(true)] out TComp3? comp3,
+        [NotNullWhen(true)] out TComp4? comp4)
+    {
+        return MoveNext(out _, out comp1, out comp2, out comp3, out comp4);
+    }
+
+    public void Dispose()
+    {
+        _traitDict.Dispose();
+    }
+}
+
+#endregion
+
+#region "All" Entity Query Enumerators
+
+/// <summary>
+/// Returns all matching components, paused or not.
+/// </summary>
+public struct AllEntityQueryEnumerator<TComp1> : IDisposable
+    where TComp1 : IComponent
+{
+    private Dictionary<EntityUid, IComponent>.Enumerator _traitDict;
+
+    public AllEntityQueryEnumerator(
+        Dictionary<EntityUid, IComponent> traitDict)
+    {
+        _traitDict = traitDict.GetEnumerator();
+    }
+
+    public bool MoveNext(out EntityUid uid, [NotNullWhen(true)] out TComp1? comp1)
+    {
+        while (true)
+        {
+            if (!_traitDict.MoveNext())
+            {
+                uid = default;
+                comp1 = default;
+                return false;
+            }
+
+            var current = _traitDict.Current;
+
+            if (current.Value.Deleted)
+            {
+                continue;
+            }
+
+            uid = current.Key;
+            comp1 = (TComp1)current.Value;
+            return true;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool MoveNext([NotNullWhen(true)] out TComp1? comp1)
+    {
+        return MoveNext(out _, out comp1);
+    }
+
+    public void Dispose()
+    {
+        _traitDict.Dispose();
+    }
+}
+
+/// <summary>
+/// Returns all matching components, paused or not.
+/// </summary>
+public struct AllEntityQueryEnumerator<TComp1, TComp2> : IDisposable
+    where TComp1 : IComponent
+    where TComp2 : IComponent
+{
+    private Dictionary<EntityUid, IComponent>.Enumerator _traitDict;
+    private readonly Dictionary<EntityUid, IComponent> _traitDict2;
+
+    public AllEntityQueryEnumerator(
+        Dictionary<EntityUid, IComponent> traitDict,
+        Dictionary<EntityUid, IComponent> traitDict2)
+    {
+        _traitDict = traitDict.GetEnumerator();
+        _traitDict2 = traitDict2;
+    }
+
+    public bool MoveNext(out EntityUid uid, [NotNullWhen(true)] out TComp1? comp1, [NotNullWhen(true)] out TComp2? comp2)
+    {
+        while (true)
+        {
+            if (!_traitDict.MoveNext())
+            {
+                uid = default;
+                comp1 = default;
+                comp2 = default;
+                return false;
+            }
+
+            var current = _traitDict.Current;
+
+            if (current.Value.Deleted)
+            {
+                continue;
+            }
+
+            if (!_traitDict2.TryGetValue(current.Key, out var comp2Obj) || comp2Obj.Deleted)
+            {
+                continue;
+            }
+
+            uid = current.Key;
+            comp1 = (TComp1)current.Value;
+            comp2 = (TComp2)comp2Obj;
+            return true;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool MoveNext([NotNullWhen(true)] out TComp1? comp1, [NotNullWhen(true)] out TComp2? comp2)
+    {
+        return MoveNext(out _, out comp1, out comp2);
+    }
+
+    public void Dispose()
+    {
+        _traitDict.Dispose();
+    }
+}
+
+/// <summary>
+/// Returns all matching components, paused or not.
+/// </summary>
+public struct AllEntityQueryEnumerator<TComp1, TComp2, TComp3> : IDisposable
+    where TComp1 : IComponent
+    where TComp2 : IComponent
+    where TComp3 : IComponent
+{
+    private Dictionary<EntityUid, IComponent>.Enumerator _traitDict;
+    private readonly Dictionary<EntityUid, IComponent> _traitDict2;
+    private readonly Dictionary<EntityUid, IComponent> _traitDict3;
+
+    public AllEntityQueryEnumerator(
+        Dictionary<EntityUid, IComponent> traitDict,
+        Dictionary<EntityUid, IComponent> traitDict2,
+        Dictionary<EntityUid, IComponent> traitDict3)
+    {
+        _traitDict = traitDict.GetEnumerator();
+        _traitDict2 = traitDict2;
+        _traitDict3 = traitDict3;
+    }
+
+    public bool MoveNext(out EntityUid uid, [NotNullWhen(true)] out TComp1? comp1, [NotNullWhen(true)] out TComp2? comp2, [NotNullWhen(true)] out TComp3? comp3)
+    {
+        while (true)
+        {
+            if (!_traitDict.MoveNext())
+            {
+                uid = default;
+                comp1 = default;
+                comp2 = default;
+                comp3 = default;
+                return false;
+            }
+
+            var current = _traitDict.Current;
+
+            if (current.Value.Deleted)
+            {
+                continue;
+            }
+
+            if (!_traitDict2.TryGetValue(current.Key, out var comp2Obj) || comp2Obj.Deleted)
+            {
+                continue;
+            }
+
+            if (!_traitDict3.TryGetValue(current.Key, out var comp3Obj) || comp3Obj.Deleted)
+            {
+                continue;
+            }
+
+            uid = current.Key;
+            comp1 = (TComp1)current.Value;
+            comp2 = (TComp2)comp2Obj;
+            comp3 = (TComp3)comp3Obj;
+            return true;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool MoveNext(
+        [NotNullWhen(true)] out TComp1? comp1,
+        [NotNullWhen(true)] out TComp2? comp2,
+        [NotNullWhen(true)] out TComp3? comp3)
+    {
+        return MoveNext(out _, out comp1, out comp2, out comp3);
+    }
+
+    public void Dispose()
+    {
+        _traitDict.Dispose();
+    }
+}
+
+/// <summary>
+/// Returns all matching components, paused or not.
+/// </summary>
+public struct AllEntityQueryEnumerator<TComp1, TComp2, TComp3, TComp4> : IDisposable
+    where TComp1 : IComponent
+    where TComp2 : IComponent
+    where TComp3 : IComponent
+    where TComp4 : IComponent
+{
+    private Dictionary<EntityUid, IComponent>.Enumerator _traitDict;
+    private readonly Dictionary<EntityUid, IComponent> _traitDict2;
+    private readonly Dictionary<EntityUid, IComponent> _traitDict3;
+    private readonly Dictionary<EntityUid, IComponent> _traitDict4;
+
+    public AllEntityQueryEnumerator(
+        Dictionary<EntityUid, IComponent> traitDict,
+        Dictionary<EntityUid, IComponent> traitDict2,
+        Dictionary<EntityUid, IComponent> traitDict3,
+        Dictionary<EntityUid, IComponent> traitDict4)
+    {
+        _traitDict = traitDict.GetEnumerator();
+        _traitDict2 = traitDict2;
+        _traitDict3 = traitDict3;
+        _traitDict4 = traitDict4;
+    }
+
+    public bool MoveNext(out EntityUid uid, [NotNullWhen(true)] out TComp1? comp1, [NotNullWhen(true)] out TComp2? comp2, [NotNullWhen(true)] out TComp3? comp3, [NotNullWhen(true)] out TComp4? comp4)
+    {
+        while (true)
+        {
+            if (!_traitDict.MoveNext())
+            {
+                uid = default;
+                comp1 = default;
+                comp2 = default;
+                comp3 = default;
+                comp4 = default;
+                return false;
+            }
+
+            var current = _traitDict.Current;
+
+            if (current.Value.Deleted)
+            {
+                continue;
+            }
+
+            if (!_traitDict2.TryGetValue(current.Key, out var comp2Obj) || comp2Obj.Deleted)
+            {
+                continue;
+            }
+
+            if (!_traitDict3.TryGetValue(current.Key, out var comp3Obj) || comp3Obj.Deleted)
+            {
+                continue;
+            }
+
+            if (!_traitDict4.TryGetValue(current.Key, out var comp4Obj) || comp4Obj.Deleted)
+            {
+                continue;
+            }
+
+            uid = current.Key;
+            comp1 = (TComp1)current.Value;
+            comp2 = (TComp2)comp2Obj;
+            comp3 = (TComp3)comp3Obj;
+            comp4 = (TComp4)comp4Obj;
+            return true;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public bool MoveNext(
+        [NotNullWhen(true)] out TComp1? comp1,
+        [NotNullWhen(true)] out TComp2? comp2,
+        [NotNullWhen(true)] out TComp3? comp3,
+        [NotNullWhen(true)] out TComp4? comp4)
+    {
+        return MoveNext(out _, out comp1, out comp2, out comp3, out comp4);
+    }
+
+    public void Dispose()
+    {
+        _traitDict.Dispose();
+    }
+}
+
+    #endregion
+
+    #endregion
+
+}
+
+
+
